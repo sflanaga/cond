@@ -10,4 +10,12 @@ edition = "2018"
 name="cond"
 path="src/cond.rs"
 
+[[bin]]
+name="parls"
+path="src/parls.rs"
+
 [dependencies]
+structopt = {version = "0.3.1", feature=["color","termsize","wrap_help"]}
+num_cpus = "1.0"
+lazy_static = "1.4.0"
+
