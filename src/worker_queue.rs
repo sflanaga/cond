@@ -65,22 +65,34 @@ impl<T> WorkerQueue<T> {
         l.curr_waiters
     }
 
-    pub fn wait_for_finish_timeout(&self, dur: Duration) -> usize {
-        let mut l = self.tqueue.lock().unwrap();
-        while !(l.queue.len() <= 0 && l.curr_waiters == l.max_waiters) {
-            let x = self.looks_done.wait_timeout(l, dur).unwrap();
-            l = x.0;
-            if x.1.timed_out() { return 0; }
+    pub fn wait_for_finish_timeout(&self, dur: Duration) -> Result<i64, Box<dyn std::error::Error>> {
+        let mut ret = 0i64;
+        {
+            let mut l = self.tqueue.lock().unwrap();
+            // sanity check because we have more new work than the queue can hold
+            if l.limit > 0 && l.curr_waiters == l.max_waiters && l.queue.len() >= l.limit {
+                Err(format!("Queue looks stuck at limit {} and waiters {}", &l.queue.len(), &l.curr_waiters))?;
+            }
+            while !(l.queue.len() <= 0 && l.curr_waiters == l.max_waiters) {
+                let x = self.looks_done.wait_timeout(l, dur).unwrap();
+                l = x.0;
+                if x.1.timed_out() { return Ok(-1); }
+            }
+            ret = l.curr_waiters as i64;
         }
-        l.curr_waiters
+        Ok(ret)
     }
 
-    pub fn wait_for_finish(&self) -> usize {
+    pub fn wait_for_finish(&self)-> Result<usize, Box<dyn std::error::Error>> {
         let mut l = self.tqueue.lock().unwrap();
+        // sanity check because we have more new work than the queue can hold
+        if l.limit > 0 && l.curr_waiters == l.max_waiters && l.queue.len() >= l.limit {
+            Err(format!("Queue looks stuck at limit {} and waiters {}", &l.queue.len(), &l.curr_waiters))?;
+        }
         while !(l.queue.len() <= 0 && l.curr_waiters == l.max_waiters) {
             l = self.looks_done.wait(l).unwrap();
         }
-        l.curr_waiters
+        Ok(l.curr_waiters)
     }
 
     pub fn notify_all(&self) {

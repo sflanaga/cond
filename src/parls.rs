@@ -6,7 +6,12 @@ mod worker_queue;
 
 use worker_queue::*;
 use std::path::PathBuf;
-use std::fs::{metadata, read_dir, symlink_metadata};
+use std::fs::{metadata, read_dir, symlink_metadata, Metadata};
+
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::{PermissionsExt, MetadataExt};
+
+
 use lazy_static::lazy_static;
 
 fn main() {
@@ -43,10 +48,10 @@ pub struct ParLsCfg {
     pub verbose: usize,
 }
 
-fn worker(queue: &mut WorkerQueue<Option<PathBuf>>) {
+fn worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<(PathBuf, Metadata)>>) {
     // get back to work slave loop....
     loop {
-        match _worker(queue) {
+        match _worker(queue, out_q) {
             Err(e) => {
                 // filthy filthy error catch
                 eprintln!("error: {}   get back to work", e);
@@ -56,7 +61,7 @@ fn worker(queue: &mut WorkerQueue<Option<PathBuf>>) {
     }
 }
 
-fn _worker(queue: &mut WorkerQueue<Option<PathBuf>>) -> Result<(), Box<dyn std::error::Error>> {
+fn _worker(queue: &mut WorkerQueue<Option<PathBuf>>,out_q: &mut WorkerQueue<Option<(PathBuf, Metadata)>>) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         match queue.pop() {
             None => break,
@@ -68,7 +73,7 @@ fn _worker(queue: &mut WorkerQueue<Option<PathBuf>>) -> Result<(), Box<dyn std::
                 {
                     for entry in std::fs::read_dir(p)? {
                         let entry = entry?;
-                        let path = entry.path();
+                        let path = entry.path().canonicalize().unwrap();
                         let md = symlink_metadata(&path)?;
                         if CLI.verbose > 1 {
                             eprintln!("raw meta: {:#?}", &md);
@@ -76,7 +81,8 @@ fn _worker(queue: &mut WorkerQueue<Option<PathBuf>>) -> Result<(), Box<dyn std::
                         let file_type = md.file_type();
                         if !file_type.is_symlink() {
                             if file_type.is_file() {
-                                println!("{}", path.to_string_lossy());
+                                out_q.push(Some((path,md)));
+                                //write_meta(&path, &md);
                             } else if file_type.is_dir() {
                                 other_dirs.push(path);
                             }
@@ -95,6 +101,17 @@ fn _worker(queue: &mut WorkerQueue<Option<PathBuf>>) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
+fn write_meta(path: &PathBuf, meta: &Metadata) {
+    println!("{}|{}|{:o}|{}", path.to_string_lossy(), meta.size(), meta.permissions().mode(), meta.uid());
+}
+
+#[cfg(target_family = "windows")]
+fn write_meta(path: &PathBuf, meta: &Metadata) {
+    println!("{}|{}", path.to_string_lossy(), meta.len());
+
+}
+
 lazy_static! {
     static ref CLI: ParLsCfg = {
        get_cli()
@@ -109,27 +126,47 @@ fn get_cli() -> ParLsCfg {
     cfg
 }
 
+fn file_track(q: &mut WorkerQueue<Option<(PathBuf, Metadata)>>) {
+    loop {
+        match q.pop() {
+            Some((path, md)) => write_meta(&path, &md),
+            None => break,
+        }
+    }
+}
 
 fn parls() -> Result<(), Box<dyn std::error::Error>> {
     let mut q: WorkerQueue<Option<PathBuf>> = WorkerQueue::new(CLI.no_threads,  CLI.queue_limit);
+    let mut oq: WorkerQueue<Option<(PathBuf, Metadata)>> = WorkerQueue::new(1,  10000);
 
     CLI.dirs.iter().for_each(|x| q.push(Some(x.to_path_buf())));
 
     let mut handles = vec![];
     for i in 0..CLI.no_threads {
         let mut q = q.clone();
-        let h = spawn(move || worker(&mut q));
+        let mut oq = oq.clone();
+        let h = spawn(move || worker(&mut q, &mut oq));
         handles.push(h);
     }
 
+    let mut c_oq = oq.clone();
+    let w_h = spawn(move||file_track(&mut c_oq));
+
+    let n_threads = CLI.no_threads;
     loop {
         let x = q.wait_for_finish_timeout(Duration::from_millis(250));
-        if x == CLI.no_threads { break; } else {
-            q.notify_all();
-            if CLI.verbose > 0 {
-                q.status();
-            }
+        match q.wait_for_finish_timeout(Duration::from_millis(250))? {
+            no_threads => break,
+            -1 => {},  // timed out
+            _ => { q.notify_all(); if CLI.verbose > 0 { q.status();} },
         }
+//        if x == CLI.no_threads { break; }
+//        else {
+//            q.notify_all();
+//            if CLI.verbose > 0 {
+//                q.status();
+//            }
+//        }
     }
 
     if CLI.verbose > 0 { eprintln!("finished so sends the Nones and join"); }
