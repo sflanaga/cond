@@ -16,8 +16,8 @@ use lazy_static::lazy_static;
 
 fn main() {
     if let Err(err) = parls() {
-        eprintln!("error: {}", &err);
-        std::process::exit(1);
+        eprintln!("ERROR in main: {}", &err);
+        std::process::exit(11);
     }
 }
 
@@ -39,8 +39,8 @@ pub struct ParLsCfg {
     /// Number worker threads - defaults to 0 which means # of cpus
     pub no_threads: usize,
 
-    #[structopt(short = "q", long = "queue_limit", default_value("10000"))]
-    /// Limit of the queue size so that we do not get too greedy with memory
+    #[structopt(short = "q", long = "queue_limit", default_value("0"))]
+    /// Limit of the queue size so that we do not get too greedy with memory - 0 means no limit
     pub queue_limit: usize,
 
     #[structopt(short = "v", parse(from_occurrences))]
@@ -54,7 +54,7 @@ fn worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Opti
         match _worker(queue, out_q) {
             Err(e) => {
                 // filthy filthy error catch
-                eprintln!("error: {}   get back to work", e);
+                eprintln!("ERROR in worker: {}   get back to work", e);
             }
             Ok(()) => return,
         }
@@ -67,27 +67,28 @@ fn _worker(queue: &mut WorkerQueue<Option<PathBuf>>,out_q: &mut WorkerQueue<Opti
             None => break,
             Some(p) => { //println!("path: {}", p.to_str().unwrap()),
                 if CLI.verbose > 0 {
-                    eprintln!("listing for {}", p.to_string_lossy());
+                    if p.to_str().is_none() { break; }
+                    else {eprintln!("listing for {}", p.to_str().unwrap());}
                 }
                 let mut other_dirs = vec![];
                 {
                     for entry in std::fs::read_dir(p)? {
                         let entry = entry?;
-                        let path = entry.path().canonicalize().unwrap();
+                        let path = entry.path().canonicalize()?;
                         let md = symlink_metadata(&path)?;
-                        if CLI.verbose > 1 {
+                        if CLI.verbose > 2 {
                             eprintln!("raw meta: {:#?}", &md);
                         }
                         let file_type = md.file_type();
                         if !file_type.is_symlink() {
                             if file_type.is_file() {
-                                out_q.push(Some((path,md)));
+                                out_q.push(Some((path,md)))?;
                                 //write_meta(&path, &md);
                             } else if file_type.is_dir() {
                                 other_dirs.push(path);
                             }
                         } else {
-                            if CLI.verbose>0 { eprintln!("skipping sym link: {}", path.to_string_lossy()); }
+                            if CLI.verbose > 0 { eprintln!("skipping sym link: {}", path.to_string_lossy()); }
                         }
                     }
                     // making extra sure we drop or close out the read_dir
@@ -137,9 +138,9 @@ fn file_track(q: &mut WorkerQueue<Option<(PathBuf, Metadata)>>) {
 
 fn parls() -> Result<(), Box<dyn std::error::Error>> {
     let mut q: WorkerQueue<Option<PathBuf>> = WorkerQueue::new(CLI.no_threads,  CLI.queue_limit);
-    let mut oq: WorkerQueue<Option<(PathBuf, Metadata)>> = WorkerQueue::new(1,  10000);
+    let mut oq: WorkerQueue<Option<(PathBuf, Metadata)>> = WorkerQueue::new(1,  0);
 
-    CLI.dirs.iter().for_each(|x| q.push(Some(x.to_path_buf())));
+    CLI.dirs.iter().for_each(|x| q.push(Some(x.to_path_buf())).expect("Could not evern prime the pump with initial directories"));
 
     let mut handles = vec![];
     for i in 0..CLI.no_threads {
@@ -154,36 +155,26 @@ fn parls() -> Result<(), Box<dyn std::error::Error>> {
 
     let n_threads = CLI.no_threads;
     loop {
-        let x = q.wait_for_finish_timeout(Duration::from_millis(250));
-        match q.wait_for_finish_timeout(Duration::from_millis(250))? {
-            no_threads => break,
-            -1 => {},  // timed out
-            _ => { q.notify_all(); if CLI.verbose > 0 { q.status();} },
-        }
-//        if x == CLI.no_threads { break; }
-//        else {
-//            q.notify_all();
-//            if CLI.verbose > 0 {
-//                q.status();
-//            }
-//        }
+        let x = q.wait_for_finish_timeout(Duration::from_millis(250))?;
+        if x != -1 {break;}
+        if CLI.verbose > 0 { q.status() };
     }
-
+    if CLI.verbose > 0 { q.print_max_queue();}
     if CLI.verbose > 0 { eprintln!("finished so sends the Nones and join"); }
     for _ in 0..CLI.no_threads { q.push(None); }
     for h in handles {
         h.join();
     }
+    if CLI.verbose > 0 {eprintln!("waiting on out finish");}
+    oq.wait_for_finish();
+    if CLI.verbose > 0 {eprintln!("push none of out queue");}
+    oq.push(None);
+    if CLI.verbose > 0 {eprintln!("joining out thread");}
+    w_h.join();
+
 
     Ok(())
 }
-
-
-
-
-
-
-
 
 
 
