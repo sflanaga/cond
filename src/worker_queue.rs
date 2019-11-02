@@ -3,6 +3,7 @@ use std::thread;
 use std::collections::LinkedList;
 use std::time::Duration;
 
+use anyhow::{Context, Result, anyhow};
 
 struct InnerQ<T> {
     queue: LinkedList<T>,
@@ -22,6 +23,12 @@ pub struct WorkerQueue<T> {
     looks_done: Arc<Condvar>,
 }
 
+#[derive(Debug)]
+pub struct QueueStats {
+    pub curr_poppers: usize,
+    pub curr_pushers: usize,
+    pub curr_q_len: usize,
+}
 
 impl<T> WorkerQueue<T> {
     pub fn new(max_waits: usize, limit_: usize) -> WorkerQueue<T> {
@@ -41,9 +48,9 @@ impl<T> WorkerQueue<T> {
             looks_done: Arc::new(Condvar::new()),
         }
     }
-    pub fn push(&mut self, item: T) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn push(&mut self, item: T) -> Result<()> {
         let mut l = self.tqueue.lock().unwrap();
-        l.curr_pushers +=1;
+        l.curr_pushers += 1;
         if l.queue.len() > l.max_q_len_reached {
             l.max_q_len_reached = l.queue.len();
         }
@@ -51,16 +58,16 @@ impl<T> WorkerQueue<T> {
             l.queue.push_front(item);
         } else {
             if l.limit <= l.queue.len() && l.curr_pushers >= l.max_waiters {
-                l.dead +=1;
+                l.dead += 1;
                 self.looks_done.notify_all();
-                Err(format!("Queue overflow reached - cannot push another, len at {} and this is the {}(th) pusher", l.queue.len(), l.curr_pushers))?;
+                Err(anyhow!("Queue overflow reached - cannot push another, len at {} and this is the {}(th) pusher", l.queue.len(), l.curr_pushers))?;
             }
             while l.limit > 0 && l.queue.len() >= l.limit {
                 l = self.cond_hasroom.wait(l).unwrap();
             }
             l.queue.push_front(item);
         }
-        l.curr_pushers -=1;
+        l.curr_pushers -= 1;
         self.cond_more.notify_one();
         Ok(())
     }
@@ -83,7 +90,7 @@ impl<T> WorkerQueue<T> {
         l.curr_poppers
     }
 
-    pub fn wait_for_finish_timeout(&self, dur: Duration) -> Result<i64, Box<dyn std::error::Error>> {
+    pub fn wait_for_finish_timeout(&self, dur: Duration) -> Result<i64> {
         let mut ret = 0i64;
         {
             let mut l = self.tqueue.lock().unwrap();
@@ -95,10 +102,10 @@ impl<T> WorkerQueue<T> {
                     return Ok(-1);
                 }
                 if l.limit != 0 && l.curr_pushers >= l.max_waiters && l.queue.len() >= (l.limit) {
-                    Err(format!("Queue looks stuck at limit {} and pushers {}", &l.queue.len(), &l.curr_pushers))?;
+                    Err(anyhow!("Queue looks stuck at limit {} and pushers {}", &l.queue.len(), &l.curr_pushers))?;
                 }
                 if l.dead > 0 {
-                    Err(format!("Thread death detected - likely due to overflow, #dead: {}", l.dead))?;
+                    Err(anyhow!("Thread death detected - likely due to overflow, #dead: {}", l.dead))?;
                 }
             }
             ret = l.curr_poppers as i64;
@@ -107,11 +114,11 @@ impl<T> WorkerQueue<T> {
         Ok(ret)
     }
 
-    pub fn wait_for_finish(&self)-> Result<usize, Box<dyn std::error::Error>> {
+    pub fn wait_for_finish(&self) -> Result<usize> {
         let mut l = self.tqueue.lock().unwrap();
         // sanity check because we have more new work than the queue can hold
         if l.limit > 0 && l.curr_pushers >= l.max_waiters && l.queue.len() >= l.limit {
-            Err(format!("Queue looks stuck at limit {} and waiters {}", &l.queue.len(), &l.curr_poppers))?;
+            Err(anyhow!("Queue looks stuck at limit {} and waiters {}", &l.queue.len(), &l.curr_poppers))?;
         }
         while !(l.queue.len() <= 0 && l.curr_poppers >= l.max_waiters) {
             l = self.looks_done.wait(l).unwrap();
@@ -131,5 +138,14 @@ impl<T> WorkerQueue<T> {
     pub fn print_max_queue(&self) {
         let mut l = self.tqueue.lock().unwrap();
         eprintln!("max q reached: {}", l.max_q_len_reached);
+    }
+
+    pub fn get_stats(&self) -> QueueStats {
+        let mut l = self.tqueue.lock().unwrap();
+        QueueStats {
+            curr_pushers: l.curr_pushers,
+            curr_poppers: l.curr_poppers,
+            curr_q_len: l.queue.len()
+        }
     }
 }

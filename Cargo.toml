@@ -18,4 +18,5 @@ path="src/parls.rs"
 structopt = {version = "0.3.1", feature=["color","termsize","wrap_help"]}
 num_cpus = "1.0"
 lazy_static = "1.4.0"
+anyhow = "1.0.18"
 
