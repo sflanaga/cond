@@ -8,8 +8,13 @@ use worker_queue::*;
 use std::path::PathBuf;
 use std::fs::{metadata, read_dir, symlink_metadata, Metadata, FileType};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
 #[cfg(target_family = "unix")]
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
+
+#[cfg(target_family = "unix")]
+use users::{get_user_by_uid, get_current_uid};
+
 #[cfg(target_family = "windows")]
 use std::os::windows::fs::{MetadataExt};
 
@@ -18,9 +23,8 @@ use lazy_static::lazy_static;
 use std::thread;
 use std::sync::Arc;
 
-use users::{get_user_by_uid, get_current_uid};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, anyhow, Result};
 use std::time::SystemTime;
 use std::collections::{LinkedList, BTreeMap, BinaryHeap};
 
@@ -47,7 +51,7 @@ author, about
 /// Perform a sql-like group by on csv or arbitrary text files organized into lines.  You can use multiple regex entries to attempt to capture a record across multiple lines such as xml files, but this is very experiemental.
 ///
 pub struct ParLsCfg {
-    #[structopt(name = "DIRECTORY")]
+    #[structopt(name = "DIRECTORY", parse(try_from_str=dir_check))]
     /// A list of directories to walk
     pub dir: PathBuf,
 
@@ -75,6 +79,14 @@ pub struct ParLsCfg {
     /// Disk usage mode - do not write the files found
     pub usage_mode: bool,
 
+    #[structopt(short = "d", long = "delimiter", default_value("|"))]
+    /// Disk usage mode - do not write the files found
+    pub delimiter: char,
+
+    #[structopt(long = "stats")]
+    /// Disk usage mode - do not write the files found
+    pub stats: bool,
+
     #[structopt(long = "file_newer_than", parse(try_from_str = parse_timespec))]
     /// Only count/sum entries newer than this age
     pub file_newer_than: Option<SystemTime>,
@@ -88,6 +100,17 @@ fn parse_timespec(str: &str) -> Result<SystemTime> {
     let dur = dur_from_str(str)?;
     let ret = SystemTime::now() - dur;
     Ok(ret)
+}
+
+fn dir_check(s: &str) -> Result<PathBuf> {
+    let p = PathBuf::from(s);
+
+    let m = symlink_metadata(&p).with_context(|| format!("path specified: {}", s))?;
+    if !m.is_dir() {
+        return Err(anyhow!("{} not a directory", s));
+    }
+
+    Ok(p)
 }
 
 lazy_static! {
@@ -105,10 +128,10 @@ fn get_cli() -> ParLsCfg {
 }
 
 
-fn worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>) {
+fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>) {
     // get back to work slave loop....
     loop {
-        match _worker(queue, out_q) {
+        match _read_dir_worker(queue, out_q) {
             Err(e) => {
                 // filthy filthy error catch
                 eprintln!("continue error: {}  cause: {}", e, e.root_cause());
@@ -118,12 +141,12 @@ fn worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Opti
     }
 }
 
-fn _worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>) -> Result<()> {
+fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>) -> Result<()> {
     loop {
         match queue.pop() {
             None => break,
             Some(p) => { //println!("path: {}", p.to_str().unwrap()),
-                if CLI.verbose > 0 {
+                if CLI.verbose > 1 {
                     if p.to_str().is_none() { break; } else { eprintln!("listing for {}", p.to_str().unwrap()); }
                 }
                 let mut other_dirs = vec![];
@@ -173,7 +196,9 @@ fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
         x if x.is_symlink() => 's',
         _ => 'N',
     };
-    println!("{}|{}|{}|{:o}|{}|{}", file_type, path.to_string_lossy(), meta.size(), meta.permissions().mode(), meta.uid(), meta.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs());
+    println!("{}{}{}{}{}{}{:o}{}{}{}{}", file_type, CLI.delimiter, path.to_string_lossy(),
+             CLI.delimiter, meta.size(), CLI.delimiter, meta.permissions().mode(), CLI.delimiter,
+             meta.uid(), CLI.delimiter, meta.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs());
     Ok(())
 }
 
@@ -212,7 +237,6 @@ struct DirStats {
     dir_count_recursively: u64,
 }
 
-
 impl DirStats {
     pub fn new() -> Self {
         DirStats { size_recursively: 0, size_directly: 0, file_count_recursively: 0, file_count_directly: 0, dir_count_directly: 0, dir_count_recursively: 0 }
@@ -227,7 +251,7 @@ struct U2u {
 
 struct AllStats {
     dtree: BTreeMap<PathBuf, DirStats>,
-    user_map: BTreeMap<u32, u64>,
+    user_map: BTreeMap<u32, (u64, u64)>,
     top_dir: BinaryHeap<TrackedPath>,
     top_cnt_dir: BinaryHeap<TrackedPath>,
     top_cnt_file: BinaryHeap<TrackedPath>,
@@ -236,7 +260,7 @@ struct AllStats {
     top_files: BinaryHeap<TrackedPath>,
 }
 
-fn track_top_n2(heap: &mut BinaryHeap<TrackedPath>, p: &PathBuf, s: u64, limit: usize) -> Result<bool> {
+fn track_top_n(heap: &mut BinaryHeap<TrackedPath>, p: &PathBuf, s: u64, limit: usize) -> Result<bool> {
     if s == 0 { return Ok(false); }
 
     if limit > 0 {
@@ -256,11 +280,9 @@ fn track_top_n2(heap: &mut BinaryHeap<TrackedPath>, p: &PathBuf, s: u64, limit: 
 
 #[cfg(target_family = "windows")]
 fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
-    println!("{}|{}", path.to_string_lossy(), meta.len());
+    println!("{}{}{}", path.to_string_lossy(), CLI.delimiter, meta.len());
     Ok(())
 }
-
-
 
 fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Result<()> {
     if list.len() > 0 {
@@ -277,13 +299,15 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
 
                     let filetype = afile.1.file_type();
                     let f_age = afile.1.modified()?;
-                    track_top_n2(&mut top.top_files, &afile.0.to_path_buf(), afile.1.len(), CLI.limit);
+                    track_top_n(&mut top.top_files, &afile.0.to_path_buf(), afile.1.len(), CLI.limit);
 
                     #[cfg(target_family = "windows")]
                     let uid = 0;
                     #[cfg(target_family = "unix")]
                     let uid = afile.1.uid();
-                    *top.user_map.entry(uid).or_insert(0) += afile.1.len();
+                    let ref mut tt = *top.user_map.entry(uid).or_insert((0,0) );
+                    tt.0 += 1;
+                    tt.1 += afile.1.len();
 
                     if filetype.is_file() {
                         if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
@@ -338,32 +362,35 @@ fn file_track(stats: &mut AllStats, out_q: &mut WorkerQueue<Option<Vec<(PathBuf,
     let sub_count = count.clone();
     let sub_out_q = out_q.clone();
     let sub_work_q = work_q.clone();
-    thread::spawn(move || {
-        let mut last = 0;
-        let start_f = Instant::now();
+    if CLI.stats {
+        thread::spawn(move || {
+            let mut last = 0;
+            let start_f = Instant::now();
 
-        loop {
-            thread::sleep(Duration::from_millis(CLI.ticker_interval));
-            let thiscount = sub_count.load(Ordering::Relaxed);
+            loop {
+                thread::sleep(Duration::from_millis(CLI.ticker_interval));
+                let thiscount = sub_count.load(Ordering::Relaxed);
 
-            let elapsed = start_f.elapsed();
-            let sec: f64 = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1_000_000_000.0);
-            let rate = (thiscount as f64 / sec) as usize;
+                let elapsed = start_f.elapsed();
+                let sec: f64 = (elapsed.as_secs() as f64) + (elapsed.subsec_nanos() as f64 / 1_000_000_000.0);
+                let rate = (thiscount as f64 / sec) as usize;
 
-            let stats_workers: QueueStats = sub_work_q.get_stats();
-            let stats_io: QueueStats = sub_out_q.get_stats();
-            eprint!("\rfiles: {}  rate: {}  blocked: {}  directory q len: {}  io q len: {}                 ",
-                    thiscount, rate, stats_workers.curr_poppers, stats_workers.curr_q_len, stats_io.curr_q_len);
-            if thiscount < last {
-                break;
+                let stats_workers: QueueStats = sub_work_q.get_stats();
+                let stats_io: QueueStats = sub_out_q.get_stats();
+                eprint!("\rfiles: {}  rate: {}  blocked: {}  directory q len: {}  io q len: {}                 ",
+                        thiscount, rate, stats_workers.curr_poppers, stats_workers.curr_q_len, stats_io.curr_q_len);
+                if thiscount < last {
+                    break;
+                }
+                last = thiscount;
             }
-            last = thiscount;
-        }
-    });
+        });
+    }
 
     loop {
         match out_q.pop() {
             Some(list) => {
+                count.fetch_add(list.len(), Ordering::Relaxed);
                 if CLI.usage_mode {
                     perk_up_disk_usage(stats, &list)?;
                 } else {
@@ -377,21 +404,19 @@ fn file_track(stats: &mut AllStats, out_q: &mut WorkerQueue<Option<Vec<(PathBuf,
             }
             None => break,
         }
-        count.fetch_add(1, Ordering::Relaxed);
     }
 
     count.store(0, Ordering::Relaxed);
 
     if CLI.usage_mode {
         for x in stats.dtree.iter() {
-            if CLI.verbose > 1 { println!("{},{},{}", x.0.display(), mem_metric_digit(x.1.size_recursively as usize, 4), x.1.file_count_recursively); }
-            track_top_n2(&mut stats.top_dir, &x.0, x.1.size_directly, CLI.limit); // track single immediate space
-            track_top_n2(&mut stats.top_cnt_dir, &x.0, x.1.dir_count_directly, CLI.limit); // track dir with most # of dir right under it
-            track_top_n2(&mut stats.top_cnt_file, &x.0, x.1.file_count_directly, CLI.limit); // track dir with most # of file right under it
-            track_top_n2(&mut stats.top_cnt_overall, &x.0, x.1.file_count_recursively, CLI.limit); // track overall count
-            track_top_n2(&mut stats.top_dir_overall, &x.0, x.1.size_recursively, CLI.limit); // track overall size
+            track_top_n(&mut stats.top_dir, &x.0, x.1.size_directly, CLI.limit); // track single immediate space
+            track_top_n(&mut stats.top_cnt_dir, &x.0, x.1.dir_count_directly, CLI.limit); // track dir with most # of dir right under it
+            track_top_n(&mut stats.top_cnt_file, &x.0, x.1.file_count_directly, CLI.limit); // track dir with most # of file right under it
+            track_top_n(&mut stats.top_cnt_overall, &x.0, x.1.file_count_recursively, CLI.limit); // track overall count
+            track_top_n(&mut stats.top_dir_overall, &x.0, x.1.size_recursively, CLI.limit); // track overall size
         }
-        print_top(&stats);
+        print_disk_report(&stats);
     }
 
     Ok(())
@@ -409,24 +434,26 @@ fn to_sort_vec(heap: &BinaryHeap<TrackedPath>) -> Vec<TrackedPath> {
     v
 }
 
-fn print_top(stats: &AllStats) {
-
+fn print_disk_report(stats: &AllStats) {
     #[derive(Debug)]
     struct U2u {
+        count: u64,
         size: u64,
         uid: u32
     };
-    let mut user_vec: Vec<U2u> = stats.user_map.iter().map( |(&x,&y)| U2u {size: y, uid:x } ).collect();
+    let mut user_vec: Vec<U2u> = stats.user_map.iter().map( |(&x,&y)| U2u {count: y.0, size: y.1, uid:x } ).collect();
     user_vec.sort_by( |b,a| a.size.cmp(&b.size).then(b.uid.cmp(&b.uid)) );
         //println!("File space scanned: {} and {} files in {} seconds", greek(total as f64), count, sec);
         if !user_vec.is_empty() {
-            println!("\nSpace used per user");
+            println!("\nSpace/file-count per user");
             for ue in &user_vec {
+                #[cfg(target_family = "unix")]
                 match get_user_by_uid(ue.uid) {
-                    None => println!("uid{:7} {} ", ue.uid, greek(ue.size as f64)),
-                    Some(user) => println!("{:10} {} ", user.name().to_string_lossy(), greek(ue.size as f64)),
+                    None => println!("uid{:7} {} / {}", ue.uid, greek(ue.size as f64), ue.count),
+                    Some(user) => println!("{:10} {} / {}", user.name().to_string_lossy(), greek(ue.size as f64), ue.count),
                 }
-
+                #[cfg(target_family = "windows")]
+                println!("uid{:7} {} / {}", ue.uid, greek(ue.size as f64), ue.count);
             }
         }
 
@@ -478,13 +505,12 @@ fn parls() -> Result<()> {
     };
 
     q.push(Some(CLI.dir.to_path_buf())).expect("Cannot push first item");
-    // CLI.dirs.iter().for_each(|x| q.push(Some(x.to_path_buf())).expect("Could not ever prime the pump with initial directories"));
 
     let mut handles = vec![];
     for i in 0..CLI.no_threads {
         let mut q = q.clone();
         let mut oq = oq.clone();
-        let h = spawn(move || worker(&mut q, &mut oq));
+        let h = spawn(move || read_dir_thread(&mut q, &mut oq));
         handles.push(h);
     }
 
@@ -514,6 +540,4 @@ fn parls() -> Result<()> {
 
     Ok(())
 }
-
-
 
