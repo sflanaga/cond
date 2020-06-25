@@ -21,12 +21,12 @@ use std::os::windows::fs::{MetadataExt};
 
 use lazy_static::lazy_static;
 use std::thread;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 
 use anyhow::{Context, anyhow, Result};
 use std::time::SystemTime;
-use std::collections::{LinkedList, BTreeMap, BinaryHeap};
+use std::collections::{LinkedList, BTreeMap, BinaryHeap, BTreeSet};
 
 mod util;
 
@@ -84,8 +84,13 @@ pub struct ParLsCfg {
     pub delimiter: char,
 
     #[structopt(long = "stats")]
-    /// Disk usage mode - do not write the files found
+    /// Writes stats on progress
     pub stats: bool,
+
+    #[structopt(long = "status")]
+    /// Writes thread status
+    pub status: bool,
+
 
     #[structopt(long = "file_newer_than", parse(try_from_str = parse_timespec))]
     /// Only count/sum entries newer than this age
@@ -128,10 +133,10 @@ fn get_cli() -> ParLsCfg {
 }
 
 
-fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>) {
+fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut Arc<Mutex<ThreadStatus>>) {
     // get back to work slave loop....
     loop {
-        match _read_dir_worker(queue, out_q) {
+        match _read_dir_worker(queue, out_q, t_status) {
             Err(e) => {
                 // filthy filthy error catch
                 eprintln!("continue error: {}  cause: {}", e, e.root_cause());
@@ -141,8 +146,9 @@ fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQ
     }
 }
 
-fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>) -> Result<()> {
+fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut Arc<Mutex<ThreadStatus>>) -> Result<()> {
     loop {
+        t_status.lock().unwrap().set_state("block pop");
         match queue.pop() {
             None => break,
             Some(p) => { //println!("path: {}", p.to_str().unwrap()),
@@ -151,6 +157,7 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
                 }
                 let mut other_dirs = vec![];
                 let mut metalist = vec![];
+                t_status.lock().unwrap().set_state("read dir");
                 for entry in std::fs::read_dir(&p).with_context(|| format!("read_dir on path {} failed", p.display()))?
                     //.map_err(|e| Err(format!("cannot read_dir for path {} due to error: {}", p.display(), e.to_string())))?
                     {
@@ -163,6 +170,7 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
                         let file_type: FileType = md.file_type();
                         if !file_type.is_symlink() {
                             let path = entry.path().canonicalize().with_context(|| "convert to full path error")?;
+
                             if file_type.is_file() {
                                 let f_age = md.modified()?;
                                 if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
@@ -177,14 +185,18 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
                             if CLI.verbose > 0 { eprintln!("skipping sym link: {}", path.to_string_lossy()); }
                         }
                     }
+                t_status.lock().unwrap().set_state("push meta");
                 out_q.push(Some(metalist))?;
 
+                t_status.lock().unwrap().set_state("push dirs");
                 for d in other_dirs {
                     queue.push(Some(d));
                 }
             }
         }
     }
+    t_status.lock().unwrap().set_state("exit");
+
     Ok(())
 }
 
@@ -235,6 +247,26 @@ struct DirStats {
     file_count_recursively: u64,
     dir_count_directly: u64,
     dir_count_recursively: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadStatus {
+    state: String,
+    name: String,
+}
+
+impl ThreadStatus {
+    pub fn new(state: &str, name: &str) -> ThreadStatus {
+        ThreadStatus {
+            state: state.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    pub fn set_state(&mut self, state: &str) {
+        self.state = state.to_string();
+    }
+
 }
 
 impl DirStats {
@@ -356,7 +388,11 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
     Ok(())
 }
 
-fn file_track(stats: &mut AllStats, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, work_q: &mut WorkerQueue<Option<PathBuf>>) -> Result<()> {
+fn file_track(stats: &mut AllStats,
+              out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>,
+              work_q: &mut WorkerQueue<Option<PathBuf>>,
+              t_status: Arc<Mutex<ThreadStatus>>
+) -> Result<()> {
     let mut count = Arc::new(AtomicUsize::new(0));
 
     let sub_count = count.clone();
@@ -388,15 +424,19 @@ fn file_track(stats: &mut AllStats, out_q: &mut WorkerQueue<Option<Vec<(PathBuf,
     }
 
     loop {
+        let mut c_t_status = t_status.clone();
+        t_status.lock().unwrap().set_state("popping");
         match out_q.pop() {
             Some(list) => {
                 count.fetch_add(list.len(), Ordering::Relaxed);
                 if CLI.usage_mode {
+                    t_status.lock().unwrap().set_state("record stats");
                     perk_up_disk_usage(stats, &list)?;
                 } else {
                     for (path, md) in list {
                         let f_age = md.modified()?;
                         if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
+                            t_status.lock().unwrap().set_state("write meta");
                             write_meta(&path, &md)?
                         }
                     }
@@ -405,6 +445,7 @@ fn file_track(stats: &mut AllStats, out_q: &mut WorkerQueue<Option<Vec<(PathBuf,
             None => break,
         }
     }
+    t_status.lock().unwrap().set_state("tracks");
 
     count.store(0, Ordering::Relaxed);
 
@@ -416,9 +457,11 @@ fn file_track(stats: &mut AllStats, out_q: &mut WorkerQueue<Option<Vec<(PathBuf,
             track_top_n(&mut stats.top_cnt_overall, &x.0, x.1.file_count_recursively, CLI.limit); // track overall count
             track_top_n(&mut stats.top_dir_overall, &x.0, x.1.size_recursively, CLI.limit); // track overall size
         }
+        t_status.lock().unwrap().set_state("print");
         print_disk_report(&stats);
     }
 
+    t_status.lock().unwrap().set_state("exit");
     Ok(())
 }
 
@@ -504,19 +547,46 @@ fn parls() -> Result<()> {
         user_map: BTreeMap::new(),
     };
 
+    let mut  thread_status: BTreeMap<usize, Arc<Mutex<ThreadStatus>>> = BTreeMap::new();
+
     q.push(Some(CLI.dir.to_path_buf())).expect("Cannot push first item");
 
     let mut handles = vec![];
     for i in 0..CLI.no_threads {
         let mut q = q.clone();
         let mut oq = oq.clone();
-        let h = spawn(move || read_dir_thread(&mut q, &mut oq));
+        let mut t_status = Arc::new(Mutex::new(ThreadStatus::new("NA", "read_dir")));
+        let mut c_t_status = t_status.clone();
+        thread_status.insert(thread_status.len(), t_status);
+        let h = spawn(move || read_dir_thread(&mut q, &mut oq, &mut c_t_status));
         handles.push(h);
     }
 
-    let mut c_oq = oq.clone();
-    let mut c_q = q.clone();
-    let w_h = spawn(move || file_track(&mut allstats, &mut c_oq, &mut c_q));
+    let w_h = {
+        let mut c_oq = oq.clone();
+        let mut c_q = q.clone();
+        let mut ft_status = Arc::new(Mutex::new(ThreadStatus::new("NA", "file_trk")));
+        let mut c_ft_status = ft_status.clone();
+        thread_status.insert(thread_status.len(), ft_status);
+        spawn(move || file_track(&mut allstats, &mut c_oq, &mut c_q, c_ft_status))
+    };
+
+    if CLI.status {
+        thread::spawn(move || {
+            let mut last = 0;
+            let start_f = Instant::now();
+
+            loop {
+                thread::sleep(Duration::from_millis(CLI.ticker_interval));
+                for (i,ts) in thread_status.iter() {
+                    let ts_x = ts.lock().unwrap();
+                    eprintln!("id: {}  name: {}  status: {}", i, &ts_x.name, &ts_x.state);
+                }
+                eprintln!();
+            }
+        });
+
+    }
 
     let n_threads = CLI.no_threads;
     loop {
