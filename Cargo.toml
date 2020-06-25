@@ -14,14 +14,20 @@ path="src/cond.rs"
 name="parls"
 path="src/parls.rs"
 
+[[bin]]
+name="quicky"
+path="src/quicky.rs"
+
+
+[target.'cfg(unix)'.dependencies]
+users = "0.10.0"
 
 [dependencies]
 
-#[target.'cfg(unix)'.dependencies]
-users = "0.9"
 
 structopt = {version = "0.3.1", feature=["color","termsize","wrap_help"]}
-num_cpus = "1.0"
+num_cpus = "1.13.0"
 lazy_static = "1.4.0"
-anyhow = "1.0.18"
+anyhow = "1.0.31"
+csv = "1.1.3"
 
