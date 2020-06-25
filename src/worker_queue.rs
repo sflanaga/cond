@@ -1,9 +1,8 @@
 use std::sync::{Arc, Mutex, Condvar};
-use std::thread;
 use std::collections::LinkedList;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 
 struct InnerQ<T> {
     queue: LinkedList<T>,
@@ -86,13 +85,12 @@ impl<T> WorkerQueue<T> {
         res
     }
     pub fn waiters(&self) -> usize {
-        let mut l = self.tqueue.lock().unwrap();
+        let l = self.tqueue.lock().unwrap();
         l.curr_poppers
     }
 
     pub fn wait_for_finish_timeout(&self, dur: Duration) -> Result<i64> {
-        let mut ret = 0i64;
-        {
+        let ret= {
             let mut l = self.tqueue.lock().unwrap();
             // sanity check because we have more new work than the queue can hold
             while !(l.queue.len() <= 0 && l.curr_poppers == l.max_waiters) {
@@ -108,8 +106,8 @@ impl<T> WorkerQueue<T> {
                     Err(anyhow!("Thread death detected - likely due to overflow, #dead: {}", l.dead))?;
                 }
             }
-            ret = l.curr_poppers as i64;
-        }
+            l.curr_poppers as i64
+        };
 
         Ok(ret)
     }
@@ -132,16 +130,16 @@ impl<T> WorkerQueue<T> {
     }
 
     pub fn status(&self) {
-        let mut l = self.tqueue.lock().unwrap();
+        let l = self.tqueue.lock().unwrap();
         eprintln!("q len: {}  threads:  {}  dead:  {}  poppers: {}  pushers: {}", l.queue.len(), l.max_waiters, l.dead, l.curr_poppers, l.curr_pushers);
     }
     pub fn print_max_queue(&self) {
-        let mut l = self.tqueue.lock().unwrap();
+        let l = self.tqueue.lock().unwrap();
         eprintln!("max q reached: {}", l.max_q_len_reached);
     }
 
     pub fn get_stats(&self) -> QueueStats {
-        let mut l = self.tqueue.lock().unwrap();
+        let l = self.tqueue.lock().unwrap();
         QueueStats {
             curr_pushers: l.curr_pushers,
             curr_poppers: l.curr_poppers,
