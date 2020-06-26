@@ -32,6 +32,8 @@ mod util;
 
 use util::{mem_metric_digit, dur_from_str, greek};
 use std::borrow::Borrow;
+use std::cmp::max;
+use cpu_time::ProcessTime;
 
 
 fn main() {
@@ -55,12 +57,29 @@ pub struct ParLsCfg {
     /// A list of directories to walk
     pub dir: PathBuf,
 
-    #[structopt(short = "l", name = "top_n_limit", default_value("15"))]
+    #[structopt(short = "u", long = "usage_trees")]
+    /// Disk usage mode - do not write the files found
+    pub usage_mode: bool,
+
+    #[structopt(short = "l", name = "list_files")]
+    /// Report top usage limit
+    pub list_files: bool,
+
+    #[structopt(short = "n", name = "top_n_limit", default_value("15"))]
     /// Report top usage limit
     pub limit: usize,
 
-    #[structopt(short = "n", long = "worker_threads", default_value("0"))]
-    /// Number worker threads - defaults to 0 which means # of cpus
+    #[structopt(short = "d", long = "delimiter", default_value("|"))]
+    /// Disk usage mode - do not write the files found
+    pub delimiter: char,
+
+    #[structopt(short = "t", long = "worker_threads", default_value("0"))]
+    /// Number worker threads
+    ///
+    /// defaults to 0 which means # of cpus or at least 4
+    /// Latency vs throughput:
+    /// The theory here is that parallel listing overcomes latency issues
+    /// by having multiple requests in play at once, and is not cpu bound.
     pub no_threads: usize,
 
     #[structopt(short = "q", long = "queue_limit", default_value("0"))]
@@ -75,20 +94,12 @@ pub struct ParLsCfg {
     /// Interval at which stats are written - 0 means no ticker is run
     pub ticker_interval: u64,
 
-    #[structopt(short = "u", long = "usage_trees")]
-    /// Disk usage mode - do not write the files found
-    pub usage_mode: bool,
-
-    #[structopt(short = "d", long = "delimiter", default_value("|"))]
-    /// Disk usage mode - do not write the files found
-    pub delimiter: char,
-
     #[structopt(long = "stats")]
     /// Writes stats on progress
     pub stats: bool,
 
-    #[structopt(long = "status")]
-    /// Writes thread status
+    #[structopt(long = "thread_status")]
+    /// Writes thread status - used to debug things
     pub status: bool,
 
     #[structopt(long = "file_newer_than", parse(try_from_str = parse_timespec))]
@@ -121,16 +132,23 @@ lazy_static! {
     static ref CLI: ParLsCfg = {
        get_cli()
     };
+    static ref EXE: String = get_exe_name();
 }
 
 fn get_cli() -> ParLsCfg {
     let mut cfg = ParLsCfg::from_args();
     if cfg.no_threads == 0 {
-        cfg.no_threads = num_cpus::get();
+        cfg.no_threads = max(num_cpus::get(), 4);
+    }
+    if !cfg.usage_mode && !cfg.list_files {
+        cfg.usage_mode = true;
     }
     cfg
 }
 
+fn get_exe_name() -> String {
+    std::env::args().nth(0).unwrap()
+}
 
 fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut Arc<Mutex<ThreadStatus>>) {
     // get back to work slave loop....
@@ -138,7 +156,7 @@ fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQ
         match _read_dir_worker(queue, out_q, t_status) {
             Err(e) => {
                 // filthy filthy error catch
-                eprintln!("continue error: {}  cause: {}", e, e.root_cause());
+                eprintln!("{}: major error: {}  cause: {}", *EXE, e, e.root_cause());
             }
             Ok(()) => return,
         }
@@ -152,24 +170,33 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
             None => break,
             Some(p) => { //println!("path: {}", p.to_str().unwrap()),
                 if CLI.verbose > 1 {
-                    if p.to_str().is_none() { break; } else { eprintln!("listing for {}", p.to_str().unwrap()); }
+                    if p.to_str().is_none() { break; } else { eprintln!("{}: listing for {}", *EXE, p.to_str().unwrap()); }
                 }
                 let mut other_dirs = vec![];
                 let mut metalist = vec![];
                 t_status.lock().unwrap().set_state("read dir");
-                for entry in std::fs::read_dir(&p).with_context(|| format!("read_dir on path {} failed", p.display()))?
-                //.map_err(|e| Err(format!("cannot read_dir for path {} due to error: {}", p.display(), e.to_string())))?
-                {
+                let dir_itr = match std::fs::read_dir(&p) {
+                    Err(e) => {
+                        eprintln!("{}: stat of dir: '{}', error: {}", *EXE, p.display(), e);
+                        continue;
+                    }
+                    Ok(i) => i,
+                };
+                for entry in dir_itr {
                     let entry = entry?;
                     let path = entry.path();
-                    let md = symlink_metadata(&entry.path()).with_context(|| format!("stat of path {} failed", path.display()))?;
+                    let md = match symlink_metadata(&entry.path()) {
+                        Err(e) => {
+                            eprintln!("{}: stat of file for symlink: '{}', error: {}", *EXE, p.display(), e);
+                            continue;
+                        }
+                        Ok(md) => md,
+                    };
                     if CLI.verbose > 2 {
-                        eprintln!("raw meta: {:#?}", &md);
+                        eprintln!("{}: raw meta: {:#?}", *EXE, &md);
                     }
                     let file_type: FileType = md.file_type();
                     if !file_type.is_symlink() {
-                        let path = entry.path().canonicalize().with_context(|| "convert to full path error")?;
-
                         if file_type.is_file() {
                             let f_age = md.modified()?;
                             if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
@@ -181,7 +208,7 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
                             other_dirs.push(path);
                         }
                     } else {
-                        if CLI.verbose > 0 { eprintln!("skipping sym link: {}", path.to_string_lossy()); }
+                        if CLI.verbose > 0 { eprintln!("{}: skipping sym link: {}", *EXE, path.to_string_lossy()); }
                     }
                 }
                 t_status.lock().unwrap().set_state("push meta");
@@ -308,13 +335,13 @@ fn track_top_n(heap: &mut BinaryHeap<TrackedPath>, p: &PathBuf, s: u64, limit: u
 
 #[cfg(target_family = "windows")]
 fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
-    println!("{}{}{}", path.to_string_lossy(), CLI.delimiter, meta.len());
+    println!("{}{}{}", path.canonicalize()?.display(), CLI.delimiter, meta.len());
     Ok(())
 }
 
 fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Result<()> {
     if list.len() > 0 {
-        if let Some(mut parent) = list[0].0.parent() {
+        if let Some(mut parent) = list[0].0.ancestors().next() {
             let dstats = {
                 let mut dstats: &mut DirStats = if top.dtree.contains_key(parent) {
                     top.dtree.get_mut(parent).unwrap()
@@ -357,7 +384,7 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
             };
             // go up tree and add stuff
             loop {
-                if let Some(mut nextpar) = parent.parent() {
+                if let Some(mut nextpar) = parent.ancestors().next() {
                     if nextpar == parent {
                         break;
                     }
@@ -383,12 +410,14 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
     Ok(())
 }
 
-fn file_track(stats: &mut AllStats,
+fn file_track(startout: Instant,
+              cputime: ProcessTime,
+              stats: &mut AllStats,
               out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>,
               work_q: &mut WorkerQueue<Option<PathBuf>>,
               t_status: Arc<Mutex<ThreadStatus>>,
 ) -> Result<()> {
-    let mut count = Arc::new(AtomicUsize::new(0));
+    let count = Arc::new(AtomicUsize::new(0));
 
     let sub_count = count.clone();
     let sub_out_q = out_q.clone();
@@ -427,7 +456,8 @@ fn file_track(stats: &mut AllStats,
                 if CLI.usage_mode {
                     t_status.lock().unwrap().set_state("record stats");
                     perk_up_disk_usage(stats, &list)?;
-                } else {
+                }
+                if CLI.list_files {
                     for (path, md) in list {
                         let f_age = md.modified()?;
                         if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
@@ -442,9 +472,12 @@ fn file_track(stats: &mut AllStats,
     }
     t_status.lock().unwrap().set_state("tracks");
 
+    let last_count = count.load(Ordering::Relaxed);
     count.store(0, Ordering::Relaxed);
 
     if CLI.usage_mode {
+        println!("Done scanning {} nodes in {} seconds and {} cpu-seconds", last_count,
+                (Instant::now()-startout).as_secs_f64(), cputime.elapsed().as_secs_f64());
         for x in stats.dtree.iter() {
             track_top_n(&mut stats.top_dir, &x.0, x.1.size_directly, CLI.limit); // track single immediate space
             track_top_n(&mut stats.top_cnt_dir, &x.0, x.1.dir_count_directly, CLI.limit); // track dir with most # of dir right under it
@@ -498,51 +531,51 @@ fn print_disk_report(stats: &AllStats) {
 
     fn strip<'a>(base: &'a Path, tar: &'a Path) -> &'a str {
         //println!("strip: b: {}  tar: {}", base.to_str().unwrap(), tar.to_str().unwrap());
-        tar.strip_prefix(base).unwrap().to_str().unwrap()
-    }
-
-    let base = CLI.dir.canonicalize().unwrap();
-
-
-    println!("\nTop dir with space usage directly inside them:");
-    for v in to_sort_vec(&stats.top_dir) {
-        if v.path.starts_with(&base) {
-            println!("{:10} {}", greek(v.size as f64), strip(&base, &v.path));
+        if base == tar {
+            base.to_str().unwrap()
+        } else {
+            tar.strip_prefix(base).unwrap().to_str().unwrap()
         }
     }
 
-    println!("\nTop dir size recursive:");
-    for v in to_sort_vec(&stats.top_dir_overall) {
-        if v.path.starts_with(&base) {
-            println!("{:10} {}", greek(v.size as f64), strip(&base, &v.path));
+    if !stats.top_dir.is_empty() {
+        println!("\nTop dir with space usage directly inside them: {}", stats.top_dir.len());
+        for v in to_sort_vec(&stats.top_dir) {
+            println!("{:10} {}", greek(v.size as f64), &v.path.display());
         }
     }
 
-    println!("\nTop count of files recursive:");
-    for v in to_sort_vec(&stats.top_cnt_overall) {
-        if v.path.starts_with(&base) {
-            println!("{:10} {}", v.size, strip(&base, &v.path));
+    if !stats.top_dir_overall.is_empty() {
+        println!("\nTop dir size recursive: {}", stats.top_dir_overall.len());
+        for v in to_sort_vec(&stats.top_dir_overall) {
+                println!("{:10} {}", greek(v.size as f64), &v.path.display());
         }
     }
 
-    println!("\nTop counts of files in a single directory:");
-    for v in to_sort_vec(&stats.top_cnt_file) {
-        if v.path.starts_with(&base) {
-            println!("{:10} {}", v.size, strip(&base, &v.path));
+    if !stats.top_cnt_overall.is_empty() {
+        println!("\nTop count of files recursive: {}", stats.top_cnt_overall.len());
+        for v in to_sort_vec(&stats.top_cnt_overall) {
+                println!("{:10} {}", v.size, &v.path.display());
         }
     }
 
-    println!("\nTop counts of directories in a single directory:");
-    for v in to_sort_vec(&stats.top_cnt_dir) {
-        if v.path.starts_with(&base) {
-            println!("{:10} {}", v.size, strip(&base, &v.path));
+    if !stats.top_cnt_file.is_empty() {
+        println!("\nTop counts of files in a single directory: {}", stats.top_cnt_file.len());
+        for v in to_sort_vec(&stats.top_cnt_file) {
+                println!("{:10} {}", v.size, &v.path.display());
         }
     }
 
-    println!("\nLargest file(s):");
-    for v in to_sort_vec(&stats.top_files) {
-        if v.path.starts_with(&base) {
-            println!("{:10} {}", greek(v.size as f64), strip(&base, &v.path));
+    if !stats.top_cnt_dir.is_empty() {
+        println!("\nTop counts of directories in a single directory: {}", stats.top_cnt_dir.len());
+        for v in to_sort_vec(&stats.top_cnt_dir) {
+                println!("{:10} {}", v.size, &v.path.display());
+        }
+    }
+    if !stats.top_files.is_empty() {
+        println!("\nLargest file(s): {}", stats.top_files.len());
+        for v in to_sort_vec(&stats.top_files) {
+                println!("{:10} {}", greek(v.size as f64), &v.path.display());
         }
     }
 }
@@ -565,7 +598,9 @@ fn parls() -> Result<()> {
 
     let mut thread_status: BTreeMap<usize, Arc<Mutex<ThreadStatus>>> = BTreeMap::new();
 
-    q.push(Some(CLI.dir.to_path_buf())).expect("Cannot push first item");
+    q.push(Some(CLI.dir.to_path_buf())).with_context(|| format!("Cannot push top path: {}", CLI.dir.display()))?;
+    let startout = Instant::now();
+    let startcpu = ProcessTime::now();
 
     let mut handles = vec![];
     for i in 0..CLI.no_threads {
@@ -584,7 +619,7 @@ fn parls() -> Result<()> {
         let mut ft_status = Arc::new(Mutex::new(ThreadStatus::new("NA", "file_trk")));
         let mut c_ft_status = ft_status.clone();
         thread_status.insert(thread_status.len(), ft_status);
-        spawn(move || file_track(&mut allstats, &mut c_oq, &mut c_q, c_ft_status))
+        spawn(move || file_track(startout, startcpu, &mut allstats, &mut c_oq, &mut c_q, c_ft_status))
     };
 
     if CLI.status {
@@ -602,7 +637,12 @@ fn parls() -> Result<()> {
             }
         });
     }
-
+    match (CLI.list_files,CLI.usage_mode) {
+        (true, true) => println!("List file stats and disk usage summary for: {}", CLI.dir.display()),
+        (false, true) => println!("Scanning disk usage summary for: {}", CLI.dir.display()),
+        (true, false) => println!("List file stats under: {}", CLI.dir.display()),
+        _ => Err(anyhow!("Error - neither usage or list mode specified"))?,
+    }
     let n_threads = CLI.no_threads;
     loop {
         let x = q.wait_for_finish_timeout(Duration::from_millis(250))?;
