@@ -341,7 +341,8 @@ fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
 
 fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Result<()> {
     if list.len() > 0 {
-        if let Some(mut parent) = list[0].0.ancestors().next() {
+        if let Some(mut parent) = list[0].0.ancestors().skip(1).next() {
+            if parent == CLI.dir { return Ok(()); }
             let dstats = {
                 let mut dstats: &mut DirStats = if top.dtree.contains_key(parent) {
                     top.dtree.get_mut(parent).unwrap()
@@ -384,7 +385,9 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
             };
             // go up tree and add stuff
             loop {
-                if let Some(mut nextpar) = parent.ancestors().next() {
+                if let Some(mut nextpar) = parent.ancestors().skip(1).next() {
+                    if parent == CLI.dir { break; }
+
                     if nextpar == parent {
                         break;
                     }
@@ -548,7 +551,8 @@ fn print_disk_report(stats: &AllStats) {
     if !stats.top_dir_overall.is_empty() {
         println!("\nTop dir size recursive: {}", stats.top_dir_overall.len());
         for v in to_sort_vec(&stats.top_dir_overall) {
-                println!("{:10} {}", greek(v.size as f64), &v.path.display());
+            //let rel = v.path.as_path().strip_prefix(CLI.dir.as_path()).unwrap();
+            println!("{:10} {}", greek(v.size as f64), &v.path.display());
         }
     }
 
