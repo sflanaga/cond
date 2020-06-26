@@ -5,7 +5,7 @@ use structopt::StructOpt;
 mod worker_queue;
 
 use worker_queue::*;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use std::fs::{metadata, read_dir, symlink_metadata, Metadata, FileType};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -51,7 +51,7 @@ author, about
 /// Perform a sql-like group by on csv or arbitrary text files organized into lines.  You can use multiple regex entries to attempt to capture a record across multiple lines such as xml files, but this is very experiemental.
 ///
 pub struct ParLsCfg {
-    #[structopt(name = "DIRECTORY", parse(try_from_str=dir_check))]
+    #[structopt(name = "DIRECTORY", parse(try_from_str = dir_check))]
     /// A list of directories to walk
     pub dir: PathBuf,
 
@@ -90,7 +90,6 @@ pub struct ParLsCfg {
     #[structopt(long = "status")]
     /// Writes thread status
     pub status: bool,
-
 
     #[structopt(long = "file_newer_than", parse(try_from_str = parse_timespec))]
     /// Only count/sum entries newer than this age
@@ -159,32 +158,32 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
                 let mut metalist = vec![];
                 t_status.lock().unwrap().set_state("read dir");
                 for entry in std::fs::read_dir(&p).with_context(|| format!("read_dir on path {} failed", p.display()))?
-                    //.map_err(|e| Err(format!("cannot read_dir for path {} due to error: {}", p.display(), e.to_string())))?
-                    {
-                        let entry = entry?;
-                        let path = entry.path();
-                        let md = symlink_metadata(&entry.path()).with_context(|| format!("stat of path {} failed", path.display()))?;
-                        if CLI.verbose > 2 {
-                            eprintln!("raw meta: {:#?}", &md);
-                        }
-                        let file_type: FileType = md.file_type();
-                        if !file_type.is_symlink() {
-                            let path = entry.path().canonicalize().with_context(|| "convert to full path error")?;
-
-                            if file_type.is_file() {
-                                let f_age = md.modified()?;
-                                if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
-                                    metalist.push((path.clone(), md.clone()));
-                                    //write_meta(&path, &md);
-                                }
-                            } else if file_type.is_dir() {
-                                metalist.push((path.clone(), md));
-                                other_dirs.push(path);
-                            }
-                        } else {
-                            if CLI.verbose > 0 { eprintln!("skipping sym link: {}", path.to_string_lossy()); }
-                        }
+                //.map_err(|e| Err(format!("cannot read_dir for path {} due to error: {}", p.display(), e.to_string())))?
+                {
+                    let entry = entry?;
+                    let path = entry.path();
+                    let md = symlink_metadata(&entry.path()).with_context(|| format!("stat of path {} failed", path.display()))?;
+                    if CLI.verbose > 2 {
+                        eprintln!("raw meta: {:#?}", &md);
                     }
+                    let file_type: FileType = md.file_type();
+                    if !file_type.is_symlink() {
+                        let path = entry.path().canonicalize().with_context(|| "convert to full path error")?;
+
+                        if file_type.is_file() {
+                            let f_age = md.modified()?;
+                            if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
+                                metalist.push((path.clone(), md.clone()));
+                                //write_meta(&path, &md);
+                            }
+                        } else if file_type.is_dir() {
+                            metalist.push((path.clone(), md));
+                            other_dirs.push(path);
+                        }
+                    } else {
+                        if CLI.verbose > 0 { eprintln!("skipping sym link: {}", path.to_string_lossy()); }
+                    }
+                }
                 t_status.lock().unwrap().set_state("push meta");
                 out_q.push(Some(metalist))?;
 
@@ -218,7 +217,7 @@ fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
 #[derive(Eq, Debug)]
 struct TrackedPath {
     size: u64,
-    path: String,
+    path: PathBuf,
 }
 
 impl Ord for TrackedPath {
@@ -266,7 +265,6 @@ impl ThreadStatus {
     pub fn set_state(&mut self, state: &str) {
         self.state = state.to_string();
     }
-
 }
 
 impl DirStats {
@@ -278,7 +276,7 @@ impl DirStats {
 #[derive(Debug)]
 struct U2u {
     size: u64,
-    uid: u32
+    uid: u32,
 }
 
 struct AllStats {
@@ -297,13 +295,11 @@ fn track_top_n(heap: &mut BinaryHeap<TrackedPath>, p: &PathBuf, s: u64, limit: u
 
     if limit > 0 {
         if heap.len() < limit {
-            let p = p.to_string_lossy().to_string();
-            heap.push(TrackedPath { size: s, path: p });
+            heap.push(TrackedPath { size: s, path: p.clone() });
             return Ok(true);
         } else if heap.peek().expect("internal error: cannot peek when the size is greater than 0!?").size < s {
             heap.pop();
-            let p = p.to_string_lossy().to_string();
-            heap.push(TrackedPath { size: s, path: p });
+            heap.push(TrackedPath { size: s, path: p.clone() });
             return Ok(true);
         }
     }
@@ -328,16 +324,15 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
                     top.dtree.get_mut(parent).unwrap()
                 };
                 for afile in list {
-
                     let filetype = afile.1.file_type();
                     let f_age = afile.1.modified()?;
                     track_top_n(&mut top.top_files, &afile.0.to_path_buf(), afile.1.len(), CLI.limit);
 
                     #[cfg(target_family = "windows")]
-                    let uid = 0;
+                        let uid = 0;
                     #[cfg(target_family = "unix")]
-                    let uid = afile.1.uid();
-                    let ref mut tt = *top.user_map.entry(uid).or_insert((0,0) );
+                        let uid = afile.1.uid();
+                    let ref mut tt = *top.user_map.entry(uid).or_insert((0, 0));
                     tt.0 += 1;
                     tt.1 += afile.1.len();
 
@@ -391,7 +386,7 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
 fn file_track(stats: &mut AllStats,
               out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>,
               work_q: &mut WorkerQueue<Option<PathBuf>>,
-              t_status: Arc<Mutex<ThreadStatus>>
+              t_status: Arc<Mutex<ThreadStatus>>,
 ) -> Result<()> {
     let mut count = Arc::new(AtomicUsize::new(0));
 
@@ -482,52 +477,73 @@ fn print_disk_report(stats: &AllStats) {
     struct U2u {
         count: u64,
         size: u64,
-        uid: u32
-    };
-    let mut user_vec: Vec<U2u> = stats.user_map.iter().map( |(&x,&y)| U2u {count: y.0, size: y.1, uid:x } ).collect();
-    user_vec.sort_by( |b,a| a.size.cmp(&b.size).then(b.uid.cmp(&b.uid)) );
-        //println!("File space scanned: {} and {} files in {} seconds", greek(total as f64), count, sec);
-        if !user_vec.is_empty() {
-            println!("\nSpace/file-count per user");
-            for ue in &user_vec {
-                #[cfg(target_family = "unix")]
-                match get_user_by_uid(ue.uid) {
-                    None => println!("uid{:7} {} / {}", ue.uid, greek(ue.size as f64), ue.count),
-                    Some(user) => println!("{:10} {} / {}", user.name().to_string_lossy(), greek(ue.size as f64), ue.count),
-                }
-                #[cfg(target_family = "windows")]
-                println!("uid{:7} {} / {}", ue.uid, greek(ue.size as f64), ue.count);
+        uid: u32,
+    }
+    ;
+    let mut user_vec: Vec<U2u> = stats.user_map.iter().map(|(&x, &y)| U2u { count: y.0, size: y.1, uid: x }).collect();
+    user_vec.sort_by(|b, a| a.size.cmp(&b.size).then(b.uid.cmp(&b.uid)));
+    //println!("File space scanned: {} and {} files in {} seconds", greek(total as f64), count, sec);
+    if !user_vec.is_empty() {
+        println!("\nSpace/file-count per user");
+        for ue in &user_vec {
+            #[cfg(target_family = "unix")]
+            match get_user_by_uid(ue.uid) {
+                None => println!("uid{:7} {} / {}", ue.uid, greek(ue.size as f64), ue.count),
+                Some(user) => println!("{:10} {} / {}", user.name().to_string_lossy(), greek(ue.size as f64), ue.count),
             }
+            #[cfg(target_family = "windows")]
+            println!("uid{:7} {} / {}", ue.uid, greek(ue.size as f64), ue.count);
         }
+    }
+
+    fn strip<'a>(base: &'a Path, tar: &'a Path) -> &'a str {
+        //println!("strip: b: {}  tar: {}", base.to_str().unwrap(), tar.to_str().unwrap());
+        tar.strip_prefix(base).unwrap().to_str().unwrap()
+    }
+
+    let base = CLI.dir.canonicalize().unwrap();
+
 
     println!("\nTop dir with space usage directly inside them:");
     for v in to_sort_vec(&stats.top_dir) {
-        println!("{:10} {}", greek(v.size as f64), v.path);
+        if v.path.starts_with(&base) {
+            println!("{:10} {}", greek(v.size as f64), strip(&base, &v.path));
+        }
     }
 
     println!("\nTop dir size recursive:");
     for v in to_sort_vec(&stats.top_dir_overall) {
-        println!("{:10} {}", greek(v.size as f64), v.path);
+        if v.path.starts_with(&base) {
+            println!("{:10} {}", greek(v.size as f64), strip(&base, &v.path));
+        }
     }
 
     println!("\nTop count of files recursive:");
     for v in to_sort_vec(&stats.top_cnt_overall) {
-        println!("{:10} {}", v.size, v.path);
+        if v.path.starts_with(&base) {
+            println!("{:10} {}", v.size, strip(&base, &v.path));
+        }
     }
 
     println!("\nTop counts of files in a single directory:");
     for v in to_sort_vec(&stats.top_cnt_file) {
-        println!("{:10} {}", v.size, v.path);
+        if v.path.starts_with(&base) {
+            println!("{:10} {}", v.size, strip(&base, &v.path));
+        }
     }
 
     println!("\nTop counts of directories in a single directory:");
     for v in to_sort_vec(&stats.top_cnt_dir) {
-        println!("{:10} {}", v.size, v.path);
+        if v.path.starts_with(&base) {
+            println!("{:10} {}", v.size, strip(&base, &v.path));
+        }
     }
 
     println!("\nLargest file(s):");
     for v in to_sort_vec(&stats.top_files) {
-        println!("{:10} {}", greek(v.size as f64), v.path);
+        if v.path.starts_with(&base) {
+            println!("{:10} {}", greek(v.size as f64), strip(&base, &v.path));
+        }
     }
 }
 
@@ -547,7 +563,7 @@ fn parls() -> Result<()> {
         user_map: BTreeMap::new(),
     };
 
-    let mut  thread_status: BTreeMap<usize, Arc<Mutex<ThreadStatus>>> = BTreeMap::new();
+    let mut thread_status: BTreeMap<usize, Arc<Mutex<ThreadStatus>>> = BTreeMap::new();
 
     q.push(Some(CLI.dir.to_path_buf())).expect("Cannot push first item");
 
@@ -578,14 +594,13 @@ fn parls() -> Result<()> {
 
             loop {
                 thread::sleep(Duration::from_millis(CLI.ticker_interval));
-                for (i,ts) in thread_status.iter() {
+                for (i, ts) in thread_status.iter() {
                     let ts_x = ts.lock().unwrap();
                     eprintln!("id: {}  name: {}  status: {}", i, &ts_x.name, &ts_x.state);
                 }
                 eprintln!();
             }
         });
-
     }
 
     let n_threads = CLI.no_threads;
