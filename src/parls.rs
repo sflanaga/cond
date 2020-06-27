@@ -34,6 +34,7 @@ use util::{mem_metric_digit, dur_from_str, greek};
 use std::borrow::Borrow;
 use std::cmp::max;
 use cpu_time::ProcessTime;
+use crate::util::multi_extension;
 
 
 fn main() {
@@ -247,6 +248,12 @@ struct TrackedPath {
     path: PathBuf,
 }
 
+#[derive(Eq, Debug)]
+struct TrackedExtension {
+    size: u64,
+    extension: String,
+}
+
 impl Ord for TrackedPath {
     fn cmp(&self, other: &TrackedPath) -> std::cmp::Ordering {
         self.size.cmp(&other.size).reverse()
@@ -261,6 +268,24 @@ impl PartialOrd for TrackedPath {
 
 impl PartialEq for TrackedPath {
     fn eq(&self, other: &TrackedPath) -> bool {
+        self.size == other.size
+    }
+}
+
+impl Ord for TrackedExtension {
+    fn cmp(&self, other: &TrackedExtension) -> std::cmp::Ordering {
+        self.size.cmp(&other.size).reverse()
+    }
+}
+
+impl PartialOrd for TrackedExtension {
+    fn partial_cmp(&self, other: &TrackedExtension) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TrackedExtension {
+    fn eq(&self, other: &TrackedExtension) -> bool {
         self.size == other.size
     }
 }
@@ -308,6 +333,7 @@ struct U2u {
 
 struct AllStats {
     dtree: BTreeMap<PathBuf, DirStats>,
+    extensions: BTreeMap<String, u64>,
     user_map: BTreeMap<u32, (u64, u64)>,
     top_dir: BinaryHeap<TrackedPath>,
     top_cnt_dir: BinaryHeap<TrackedPath>,
@@ -315,6 +341,24 @@ struct AllStats {
     top_cnt_overall: BinaryHeap<TrackedPath>,
     top_dir_overall: BinaryHeap<TrackedPath>,
     top_files: BinaryHeap<TrackedPath>,
+    top_ext: BinaryHeap<TrackedExtension>,
+    total_usage: u64,
+}
+
+fn track_top_n_ext(heap: &mut BinaryHeap<TrackedExtension>, ext: &String, s: u64, limit: usize) -> Result<bool> {
+    if s == 0 { return Ok(false); }
+
+    if limit > 0 {
+        if heap.len() < limit {
+            heap.push(TrackedExtension { size: s, extension: ext.clone() });
+            return Ok(true);
+        } else if heap.peek().expect("internal error: cannot peek when the size is greater than 0!?").size < s {
+            heap.pop();
+            heap.push(TrackedExtension { size: s, extension: ext.clone() });
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn track_top_n(heap: &mut BinaryHeap<TrackedPath>, p: &PathBuf, s: u64, limit: usize) -> Result<bool> {
@@ -354,6 +398,7 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
                 for afile in list {
                     let filetype = afile.1.file_type();
                     let f_age = afile.1.modified()?;
+
                     track_top_n(&mut top.top_files, &afile.0.to_path_buf(), afile.1.len(), CLI.limit);
 
                     #[cfg(target_family = "windows")]
@@ -363,9 +408,14 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
                     let ref mut tt = *top.user_map.entry(uid).or_insert((0, 0));
                     tt.0 += 1;
                     tt.1 += afile.1.len();
+                    top.total_usage += afile.1.len();
 
                     if filetype.is_file() {
                         if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
+                            let mut buff = String::new();
+                            multi_extension(&afile.0, &mut buff);
+                            let ref mut ext_sz = *top.extensions.entry(buff).or_insert(0u64);
+                            *ext_sz += afile.1.len();
                             dstats.file_count_directly += 1;
                             dstats.file_count_recursively += 1;
                             dstats.size_directly += afile.1.len();
@@ -479,8 +529,11 @@ fn file_track(startout: Instant,
     count.store(0, Ordering::Relaxed);
 
     if CLI.usage_mode {
-        println!("Done scanning {} nodes in {} seconds and {} cpu-seconds", last_count,
-                (Instant::now()-startout).as_secs_f64(), cputime.elapsed().as_secs_f64());
+        use num_format::{Locale, ToFormattedString};
+        println!("Scanned {} files / {} usage in [{:.3} / {:.3}] (real / cpu) seconds",
+                 last_count.to_formatted_string(&Locale::en),
+                 greek(stats.total_usage as f64),
+                 (Instant::now() - startout).as_secs_f64(), cputime.elapsed().as_secs_f64());
         for x in stats.dtree.iter() {
             track_top_n(&mut stats.top_dir, &x.0, x.1.size_directly, CLI.limit); // track single immediate space
             track_top_n(&mut stats.top_cnt_dir, &x.0, x.1.dir_count_directly, CLI.limit); // track dir with most # of dir right under it
@@ -488,6 +541,11 @@ fn file_track(startout: Instant,
             track_top_n(&mut stats.top_cnt_overall, &x.0, x.1.file_count_recursively, CLI.limit); // track overall count
             track_top_n(&mut stats.top_dir_overall, &x.0, x.1.size_recursively, CLI.limit); // track overall size
         }
+
+        for x in stats.extensions.iter() {
+            track_top_n_ext(&mut stats.top_ext, &x.0, *x.1, CLI.limit);
+        }
+
         t_status.lock().unwrap().set_state("print");
         print_disk_report(&stats);
     }
@@ -501,6 +559,18 @@ fn to_sort_vec(heap: &BinaryHeap<TrackedPath>) -> Vec<TrackedPath> {
     for i in heap {
         v.push(TrackedPath {
             path: i.path.clone(),
+            size: i.size,
+        });
+    }
+    v.sort();
+    v
+}
+
+fn to_sort_vec_file_ext(heap: &BinaryHeap<TrackedExtension>) -> Vec<TrackedExtension> {
+    let mut v = Vec::with_capacity(heap.len());
+    for i in heap {
+        v.push(TrackedExtension {
+            extension: i.extension.clone(),
             size: i.size,
         });
     }
@@ -528,23 +598,14 @@ fn print_disk_report(stats: &AllStats) {
                 Some(user) => println!("{:10} {} / {}", user.name().to_string_lossy(), greek(ue.size as f64), ue.count),
             }
             #[cfg(target_family = "windows")]
-            println!("uid{:7} {} / {}", ue.uid, greek(ue.size as f64), ue.count);
-        }
-    }
-
-    fn strip<'a>(base: &'a Path, tar: &'a Path) -> &'a str {
-        //println!("strip: b: {}  tar: {}", base.to_str().unwrap(), tar.to_str().unwrap());
-        if base == tar {
-            base.to_str().unwrap()
-        } else {
-            tar.strip_prefix(base).unwrap().to_str().unwrap()
+            println!("uid{:>7} {} / {}", ue.uid, greek(ue.size as f64), ue.count);
         }
     }
 
     if !stats.top_dir.is_empty() {
         println!("\nTop dir with space usage directly inside them: {}", stats.top_dir.len());
         for v in to_sort_vec(&stats.top_dir) {
-            println!("{:10} {}", greek(v.size as f64), &v.path.display());
+            println!("{:>14} {}", greek(v.size as f64), &v.path.display());
         }
     }
 
@@ -552,34 +613,41 @@ fn print_disk_report(stats: &AllStats) {
         println!("\nTop dir size recursive: {}", stats.top_dir_overall.len());
         for v in to_sort_vec(&stats.top_dir_overall) {
             //let rel = v.path.as_path().strip_prefix(CLI.dir.as_path()).unwrap();
-            println!("{:10} {}", greek(v.size as f64), &v.path.display());
+            println!("{:>14} {}", greek(v.size as f64), &v.path.display());
         }
     }
+    use num_format::{Locale, ToFormattedString};
 
     if !stats.top_cnt_overall.is_empty() {
         println!("\nTop count of files recursive: {}", stats.top_cnt_overall.len());
         for v in to_sort_vec(&stats.top_cnt_overall) {
-                println!("{:10} {}", v.size, &v.path.display());
+            println!("{:>14} {}", v.size.to_formatted_string(&Locale::en), &v.path.display());
         }
     }
 
     if !stats.top_cnt_file.is_empty() {
         println!("\nTop counts of files in a single directory: {}", stats.top_cnt_file.len());
         for v in to_sort_vec(&stats.top_cnt_file) {
-                println!("{:10} {}", v.size, &v.path.display());
+            println!("{:>14} {}", v.size.to_formatted_string(&Locale::en), &v.path.display());
         }
     }
 
     if !stats.top_cnt_dir.is_empty() {
         println!("\nTop counts of directories in a single directory: {}", stats.top_cnt_dir.len());
         for v in to_sort_vec(&stats.top_cnt_dir) {
-                println!("{:10} {}", v.size, &v.path.display());
+            println!("{:>14} {}", v.size.to_formatted_string(&Locale::en), &v.path.display());
         }
     }
     if !stats.top_files.is_empty() {
         println!("\nLargest file(s): {}", stats.top_files.len());
         for v in to_sort_vec(&stats.top_files) {
-                println!("{:10} {}", greek(v.size as f64), &v.path.display());
+            println!("{:>14} {}", greek(v.size as f64), &v.path.display());
+        }
+    }
+    if !stats.top_ext.is_empty() {
+        println!("\nSpace by file extension: {}", stats.top_ext.len());
+        for v in to_sort_vec_file_ext(&stats.top_ext) {
+            println!("{:>14} {}", greek(v.size as f64), &v.extension);
         }
     }
 }
@@ -591,13 +659,16 @@ fn parls() -> Result<()> {
 
     let mut allstats = AllStats {
         dtree: BTreeMap::new(),
+        extensions: BTreeMap::new(),
         top_files: BinaryHeap::new(),
         top_dir: BinaryHeap::new(),
         top_cnt_dir: BinaryHeap::new(),
         top_cnt_file: BinaryHeap::new(),
         top_cnt_overall: BinaryHeap::new(),
         top_dir_overall: BinaryHeap::new(),
+        top_ext: BinaryHeap::new(),
         user_map: BTreeMap::new(),
+        total_usage: 0u64,
     };
 
     let mut thread_status: BTreeMap<usize, Arc<Mutex<ThreadStatus>>> = BTreeMap::new();
@@ -641,7 +712,7 @@ fn parls() -> Result<()> {
             }
         });
     }
-    match (CLI.list_files,CLI.usage_mode) {
+    match (CLI.list_files, CLI.usage_mode) {
         (true, true) => println!("List file stats and disk usage summary for: {}", CLI.dir.display()),
         (false, true) => println!("Scanning disk usage summary for: {}", CLI.dir.display()),
         (true, false) => println!("List file stats under: {}", CLI.dir.display()),

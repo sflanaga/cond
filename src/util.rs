@@ -1,5 +1,6 @@
 use std::time::Duration;
 use anyhow::{Context, Result};
+use std::path::Path;
 
 pub fn dur_from_str(s: &str) -> Result<Duration> {
     let mut _tmp = String::new();
@@ -22,6 +23,29 @@ pub fn dur_from_str(s: &str) -> Result<Duration> {
     Ok(Duration::from_secs(tot_secs))
 }
 
+pub fn multi_extension(p: &Path, s_buff: &mut String) {
+    let filename = p.to_string_lossy();
+
+    if filename.len() == 0 {
+        return;
+    }
+
+    let mut last_i = filename.len()-1;
+    for x in filename.chars().rev().zip((0..filename.len()).rev()) {
+        // println!("i: {} {}  lasti: {}", x.0, x.1, last_i);
+
+        if (last_i - x.1) > 4 {
+            break;
+        } else if x.0 == '.' {
+            last_i = x.1;
+        }
+    }
+
+    s_buff.clear();
+    if last_i != filename.len()-1 {
+        s_buff.push_str(&filename[last_i..]);
+    }
+}
 
 fn mem_metric<'a>(v: usize) -> (f64, &'a str) {
     const METRIC: [&str; 8] = ["B ", "KB", "MB", "GB", "TB", "PB", "EB", "ZB"];
@@ -87,6 +111,6 @@ pub fn greek(v: f64) -> String {
     }
     if s.len() < 4 { s.push(' ' ); }
 
-    return format!("{}{}", s, GREEK_SUFFIXES[multi]);
+    return format!("{:<5}{}", s, GREEK_SUFFIXES[multi]);
 }
 
