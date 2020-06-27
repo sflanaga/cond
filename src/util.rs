@@ -1,13 +1,13 @@
 use std::time::Duration;
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::borrow::Cow;
 
 pub fn dur_from_str(s: &str) -> Result<Duration> {
     let mut _tmp = String::new();
     let mut tot_secs = 0u64;
     for c in s.chars() {
-        if c >= '0' && c <= '9' { _tmp.push(c); }
-        else {
+        if c >= '0' && c <= '9' { _tmp.push(c); } else {
             tot_secs += match c {
                 's' => _tmp.parse::<u64>()?,
                 'm' => _tmp.parse::<u64>()? * 60,
@@ -23,28 +23,29 @@ pub fn dur_from_str(s: &str) -> Result<Duration> {
     Ok(Duration::from_secs(tot_secs))
 }
 
-pub fn multi_extension(p: &Path, s_buff: &mut String) {
-    let filename = p.to_string_lossy();
+// Cow here let's us not allocate in the common case
+pub fn multi_extension(p: & Path) -> Option<Cow<str>> {
+    if let Some(filename) = p.to_str() {
+        if filename.len() > 0 {
+            let mut last_i = filename.len() - 1;
+            for x in filename.chars().rev().zip((0..filename.len()).rev()) {
+                // println!("i: {} {}  lasti: {}", x.0, x.1, last_i);
 
-    if filename.len() == 0 {
-        return;
-    }
+                if (last_i - x.1) > 4 {
+                    break;
+                } else if x.0 == '.' {
+                    last_i = x.1;
+                }
+            }
 
-    let mut last_i = filename.len()-1;
-    for x in filename.chars().rev().zip((0..filename.len()).rev()) {
-        // println!("i: {} {}  lasti: {}", x.0, x.1, last_i);
-
-        if (last_i - x.1) > 4 {
-            break;
-        } else if x.0 == '.' {
-            last_i = x.1;
+            if last_i != filename.len() - 1 {
+                return Some(Cow::Borrowed(&&filename[last_i..]));
+            } else {
+                return None;
+            }
         }
     }
-
-    s_buff.clear();
-    if last_i != filename.len()-1 {
-        s_buff.push_str(&filename[last_i..]);
-    }
+    None
 }
 
 fn mem_metric<'a>(v: usize) -> (f64, &'a str) {
@@ -59,6 +60,7 @@ fn mem_metric<'a>(v: usize) -> (f64, &'a str) {
     }
     (v as f64, "")
 }
+
 /// keep only a few significant digits of a simple float value
 fn sig_dig(v: f64, digits: usize) -> String {
     let x = format!("{}", v);
@@ -89,17 +91,16 @@ pub fn mem_metric_digit(v: usize, sig: usize) -> String {
         return format!("{:>width$}", "unknown", width = sig + 3);
     }
     let vt = mem_metric(v);
-    format!("{:>width$} {}", sig_dig(vt.0, sig), vt.1, width = sig + 1,)
+    format!("{:>width$} {}", sig_dig(vt.0, sig), vt.1, width = sig + 1, )
 }
 
 const GREEK_SUFFIXES: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
 
 pub fn greek(v: f64) -> String {
-
     let mut number = v;
     let mut multi = 0;
 
-    while number >= 1000.0 && multi < GREEK_SUFFIXES.len()-1 {
+    while number >= 1000.0 && multi < GREEK_SUFFIXES.len() - 1 {
         multi += 1;
         number /= 1024.0;
     }
@@ -109,8 +110,17 @@ pub fn greek(v: f64) -> String {
     if s.ends_with('.') {
         s.pop();
     }
-    if s.len() < 4 { s.push(' ' ); }
+    if s.len() < 4 { s.push(' '); }
 
     return format!("{:<5}{}", s, GREEK_SUFFIXES[multi]);
 }
 
+#[cfg(target_os = "windows")]
+pub fn gettid() -> usize {
+    unsafe { winapi::um::processthreadsapi::GetCurrentThreadId() as usize }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn gettid() -> usize {
+    unsafe { libc::syscall(libc::SYS_gettid) as usize }
+}

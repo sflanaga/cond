@@ -21,7 +21,7 @@ use std::os::windows::fs::{MetadataExt};
 
 use lazy_static::lazy_static;
 use std::thread;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 
 use anyhow::{Context, anyhow, Result};
@@ -30,8 +30,8 @@ use std::collections::{LinkedList, BTreeMap, BinaryHeap, BTreeSet};
 
 mod util;
 
-use util::{mem_metric_digit, dur_from_str, greek};
-use std::borrow::Borrow;
+use util::{mem_metric_digit, dur_from_str, greek, gettid};
+use std::borrow::{Borrow, Cow};
 use std::cmp::max;
 use cpu_time::ProcessTime;
 use crate::util::multi_extension;
@@ -95,13 +95,13 @@ pub struct ParLsCfg {
     /// Interval at which stats are written - 0 means no ticker is run
     pub ticker_interval: u64,
 
-    #[structopt(long = "stats")]
-    /// Writes stats on progress
-    pub stats: bool,
+    #[structopt(long = "progress")]
+    /// Writes progress stats on every ticker interval
+    pub progress: bool,
 
-    #[structopt(long = "thread_status")]
-    /// Writes thread status - used to debug things
-    pub status: bool,
+    #[structopt(long = "write_thread_status")]
+    /// Writes thread status every ticker interval - used to debug things
+    pub write_thread_status: bool,
 
     #[structopt(long = "file_newer_than", parse(try_from_str = parse_timespec))]
     /// Only count/sum entries newer than this age
@@ -110,6 +110,10 @@ pub struct ParLsCfg {
     #[structopt(long = "file_older_than", parse(try_from_str = parse_timespec))]
     /// Only count/sum entries older than this age
     pub file_older_than: Option<SystemTime>,
+
+    #[structopt(long = "write_thread_cpu_time")]
+    /// write cpu time consumed by each thread
+    pub write_thread_cpu_time: bool,
 }
 
 fn parse_timespec(str: &str) -> Result<SystemTime> {
@@ -153,20 +157,32 @@ fn get_exe_name() -> String {
 
 fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut Arc<Mutex<ThreadStatus>>) {
     // get back to work slave loop....
+    let t_cpu_time = cpu_time::ThreadTime::now();
     loop {
         match _read_dir_worker(queue, out_q, t_status) {
             Err(e) => {
                 // filthy filthy error catch
                 eprintln!("{}: major error: {}  cause: {}", *EXE, e, e.root_cause());
             }
-            Ok(()) => return,
+            Ok(()) => break,
         }
     }
+
+    if CLI.write_thread_cpu_time {
+        eprintln!("read dir thread cpu time: {:.3}", t_cpu_time.elapsed().as_secs_f64());
+    }
+
 }
 
 fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut Arc<Mutex<ThreadStatus>>) -> Result<()> {
     loop {
-        t_status.lock().unwrap().set_state("block pop");
+        if CLI.write_thread_status {
+            if let Ok(ref mut guard) = t_status.lock() {
+                guard.set_state("pop blocked");
+                guard.set_tid(gettid());
+            }
+        }
+
         match queue.pop() {
             None => break,
             Some(p) => { //println!("path: {}", p.to_str().unwrap()),
@@ -175,7 +191,9 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
                 }
                 let mut other_dirs = vec![];
                 let mut metalist = vec![];
-                t_status.lock().unwrap().set_state("read dir");
+                if CLI.write_thread_status {
+                    t_status.lock().unwrap().set_state("reading dir");
+                }
                 let dir_itr = match std::fs::read_dir(&p) {
                     Err(e) => {
                         eprintln!("{}: stat of dir: '{}', error: {}", *EXE, p.display(), e);
@@ -212,18 +230,24 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
                         if CLI.verbose > 0 { eprintln!("{}: skipping sym link: {}", *EXE, path.to_string_lossy()); }
                     }
                 }
-                t_status.lock().unwrap().set_state("push meta");
+
+                if CLI.write_thread_status {
+                    t_status.lock().unwrap().set_state("push meta");
+                }
                 out_q.push(Some(metalist))?;
 
-                t_status.lock().unwrap().set_state("push dirs");
+                if CLI.write_thread_status {
+                    t_status.lock().unwrap().set_state("push dirs");
+                }
                 for d in other_dirs {
                     queue.push(Some(d));
                 }
             }
         }
     }
-    t_status.lock().unwrap().set_state("exit");
-
+    if CLI.write_thread_status {
+        t_status.lock().unwrap().set_state("exit");
+    }
     Ok(())
 }
 
@@ -302,20 +326,28 @@ struct DirStats {
 
 #[derive(Debug, Clone)]
 struct ThreadStatus {
-    state: String,
     name: String,
+    // this does NOT allow dynamic strings to be placed
+    // here but it is less overhead OR maybe
+    // optimization overkill
+    state: &'static str,
+    tid: usize,
 }
 
 impl ThreadStatus {
-    pub fn new(state: &str, name: &str) -> ThreadStatus {
+    pub fn new(state: &'static str, name: &str) -> ThreadStatus {
         ThreadStatus {
-            state: state.to_string(),
             name: name.to_string(),
+            state: state,
+            tid: 0,
         }
     }
 
-    pub fn set_state(&mut self, state: &str) {
-        self.state = state.to_string();
+    pub fn set_state(&mut self, state: &'static str) {
+        self.state = state;
+    }
+    pub fn set_tid(&mut self, tid: usize) {
+        self.tid = tid;
     }
 }
 
@@ -326,7 +358,7 @@ impl DirStats {
 }
 
 #[derive(Debug)]
-struct U2u {
+struct UserUsage {
     size: u64,
     uid: u32,
 }
@@ -412,10 +444,13 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
 
                     if filetype.is_file() {
                         if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
-                            let mut buff = String::new();
-                            multi_extension(&afile.0, &mut buff);
-                            let ref mut ext_sz = *top.extensions.entry(buff).or_insert(0u64);
-                            *ext_sz += afile.1.len();
+                            if let Some(ext) = multi_extension(&afile.0) {
+                                match top.extensions.get_mut(ext.as_ref()) {
+                                    Some(ext_sz) => *ext_sz += afile.1.len(),
+                                    None => { top.extensions.insert(ext.to_string(), afile.1.len());},
+                                }
+                            };
+
                             dstats.file_count_directly += 1;
                             dstats.file_count_recursively += 1;
                             dstats.size_directly += afile.1.len();
@@ -470,12 +505,13 @@ fn file_track(startout: Instant,
               work_q: &mut WorkerQueue<Option<PathBuf>>,
               t_status: Arc<Mutex<ThreadStatus>>,
 ) -> Result<()> {
+    let t_cpu_thread_time = cpu_time::ThreadTime::now();
     let count = Arc::new(AtomicUsize::new(0));
 
     let sub_count = count.clone();
     let sub_out_q = out_q.clone();
     let sub_work_q = work_q.clone();
-    if CLI.stats {
+    if CLI.progress {
         thread::spawn(move || {
             let mut last = 0;
             let start_f = Instant::now();
@@ -502,19 +538,25 @@ fn file_track(startout: Instant,
 
     loop {
         let mut c_t_status = t_status.clone();
-        t_status.lock().unwrap().set_state("popping");
+        if CLI.write_thread_status {
+            t_status.lock().unwrap().set_state("popping");
+        }
         match out_q.pop() {
             Some(list) => {
                 count.fetch_add(list.len(), Ordering::Relaxed);
                 if CLI.usage_mode {
-                    t_status.lock().unwrap().set_state("record stats");
+                    if CLI.write_thread_status {
+                        t_status.lock().unwrap().set_state("recording stats");
+                    }
                     perk_up_disk_usage(stats, &list)?;
                 }
                 if CLI.list_files {
                     for (path, md) in list {
                         let f_age = md.modified()?;
                         if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
-                            t_status.lock().unwrap().set_state("write meta");
+                            if CLI.write_thread_status {
+                                t_status.lock().unwrap().set_state("writing meta data");
+                            }
                             write_meta(&path, &md)?
                         }
                     }
@@ -523,8 +565,9 @@ fn file_track(startout: Instant,
             None => break,
         }
     }
-    t_status.lock().unwrap().set_state("tracks");
-
+    if CLI.write_thread_status {
+        t_status.lock().unwrap().set_state("tracks");
+    }
     let last_count = count.load(Ordering::Relaxed);
     count.store(0, Ordering::Relaxed);
 
@@ -545,12 +588,17 @@ fn file_track(startout: Instant,
         for x in stats.extensions.iter() {
             track_top_n_ext(&mut stats.top_ext, &x.0, *x.1, CLI.limit);
         }
-
-        t_status.lock().unwrap().set_state("print");
+        if CLI.write_thread_status {
+            t_status.lock().unwrap().set_state("print");
+        }
         print_disk_report(&stats);
     }
-
-    t_status.lock().unwrap().set_state("exit");
+    if CLI.write_thread_status {
+        t_status.lock().unwrap().set_state("exit");
+    }
+    if CLI.write_thread_cpu_time {
+        eprintln!("file track thread cpu time: {:.3}", t_cpu_thread_time.elapsed().as_secs_f64());
+    }
     Ok(())
 }
 
@@ -652,6 +700,7 @@ fn print_disk_report(stats: &AllStats) {
     }
 }
 
+
 fn parls() -> Result<()> {
     if CLI.verbose > 0 { eprintln!("CLI: {:#?}", *CLI); }
     let mut q: WorkerQueue<Option<PathBuf>> = WorkerQueue::new(CLI.no_threads, CLI.queue_limit);
@@ -697,7 +746,7 @@ fn parls() -> Result<()> {
         spawn(move || file_track(startout, startcpu, &mut allstats, &mut c_oq, &mut c_q, c_ft_status))
     };
 
-    if CLI.status {
+    if CLI.write_thread_status {
         thread::spawn(move || {
             let mut last = 0;
             let start_f = Instant::now();
@@ -706,7 +755,7 @@ fn parls() -> Result<()> {
                 thread::sleep(Duration::from_millis(CLI.ticker_interval));
                 for (i, ts) in thread_status.iter() {
                     let ts_x = ts.lock().unwrap();
-                    eprintln!("id: {}  name: {}  status: {}", i, &ts_x.name, &ts_x.state);
+                    eprintln!("index: {:2} {}  tid:  {:6}  status: \"{}\"", i, &ts_x.name, &ts_x.tid,  &ts_x.state);
                 }
                 eprintln!();
             }
@@ -738,6 +787,7 @@ fn parls() -> Result<()> {
     w_h.join();
 
 
+    println!("last cpu time: {}", startcpu.elapsed().as_secs_f32());
     Ok(())
 }
 
