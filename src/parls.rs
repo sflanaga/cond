@@ -1,3 +1,5 @@
+mod tstatus;
+
 use std::thread::spawn;
 use std::time::{Duration, Instant};
 use structopt::StructOpt;
@@ -35,7 +37,7 @@ use std::borrow::{Borrow, Cow};
 use std::cmp::max;
 use cpu_time::ProcessTime;
 use crate::util::multi_extension;
-
+use crate::tstatus::{ThreadTracker, ThreadStatus};
 
 fn main() {
     if let Err(err) = parls() {
@@ -165,7 +167,7 @@ fn get_exe_name() -> String {
     std::env::args().nth(0).unwrap()
 }
 
-fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut Arc<Mutex<ThreadStatus>>) {
+fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut ThreadStatus) {
     // get back to work slave loop....
     let t_cpu_time = cpu_time::ThreadTime::now();
     loop {
@@ -181,29 +183,26 @@ fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQ
     if CLI.write_thread_cpu_time {
         eprintln!("read dir thread cpu time: {:.3}", t_cpu_time.elapsed().as_secs_f64());
     }
-
 }
 
-fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut Arc<Mutex<ThreadStatus>>) -> Result<()> {
+fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut ThreadStatus) -> Result<()> {
     let mut pops_done = 0;
+    t_status.register("started");
     loop {
         if CLI.update_status {
-            if let Ok(ref mut guard) = t_status.lock() {
-                guard.set_state("pop blocked");
-                guard.set_tid(gettid());
-            }
+            t_status.set_state("pop blocked");
         }
         match queue.pop() {
             None => break,
             Some(p) => { //println!("path: {}", p.to_str().unwrap()),
-                pops_done +=1;
+                pops_done += 1;
                 if CLI.verbose > 1 {
                     if p.to_str().is_none() { break; } else { eprintln!("{}: listing for {}", *EXE, p.to_str().unwrap()); }
                 }
                 let mut other_dirs = vec![];
                 let mut metalist = vec![];
                 if CLI.update_status {
-                    t_status.lock().unwrap().set_state(&format!("at {} pops; reading dir: {}", pops_done, p.display()));
+                    t_status.set_state(&format!("at {} pops; reading dir: {}", pops_done, p.display()));
                 }
                 let dir_itr = match std::fs::read_dir(&p) {
                     Err(e) => {
@@ -243,12 +242,12 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
                 }
 
                 if CLI.update_status {
-                    t_status.lock().unwrap().set_state(&format!("push meta, at {} pops", pops_done));
+                    t_status.set_state(&format!("push meta, at {} pops", pops_done));
                 }
                 out_q.push(Some(metalist))?;
 
                 if CLI.update_status {
-                    t_status.lock().unwrap().set_state(&format!("pushing {} dirs and at {} pops", other_dirs.len(), pops_done));
+                    t_status.set_state(&format!("pushing {} dirs and at {} pops", other_dirs.len(), pops_done));
                 }
                 for d in other_dirs {
                     queue.push(Some(d));
@@ -257,7 +256,7 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
         }
     }
     if CLI.update_status {
-        t_status.lock().unwrap().set_state("exit");
+        t_status.set_state("exit");
     }
     Ok(())
 }
@@ -335,33 +334,6 @@ struct DirStats {
     dir_count_recursively: u64,
 }
 
-#[derive(Debug, Clone)]
-struct ThreadStatus {
-    name: String,
-    // this does NOT allow dynamic strings to be placed
-    // here but it is less overhead OR maybe
-    // optimization overkill
-    state: String,
-    tid: usize,
-}
-
-impl ThreadStatus {
-    pub fn new(state: &str, name: &str) -> ThreadStatus {
-        ThreadStatus {
-            name: name.to_string(),
-            state: state.into(),
-            tid: 0,
-        }
-    }
-
-    pub fn set_state(&mut self, s: &str) {
-        self.state = s.into();
-    }
-
-    pub fn set_tid(&mut self, tid: usize) {
-        self.tid = tid;
-    }
-}
 
 impl DirStats {
     pub fn new() -> Self {
@@ -459,7 +431,7 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
                             if let Some(ext) = multi_extension(&afile.0) {
                                 match top.extensions.get_mut(ext.as_ref()) {
                                     Some(ext_sz) => *ext_sz += afile.1.len(),
-                                    None => { top.extensions.insert(ext.to_string(), afile.1.len());},
+                                    None => { top.extensions.insert(ext.to_string(), afile.1.len()); }
                                 }
                             };
 
@@ -515,11 +487,11 @@ fn file_track(startout: Instant,
               stats: &mut AllStats,
               out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>,
               work_q: &mut WorkerQueue<Option<PathBuf>>,
-              t_status: Arc<Mutex<ThreadStatus>>,
+              t_status: &mut ThreadStatus,
 ) -> Result<()> {
+    t_status.register("started");
     let t_cpu_thread_time = cpu_time::ThreadTime::now();
     let count = Arc::new(AtomicUsize::new(0));
-    t_status.lock().unwrap().tid = gettid();
     let sub_count = count.clone();
     let sub_out_q = out_q.clone();
     let sub_work_q = work_q.clone();
@@ -550,21 +522,21 @@ fn file_track(startout: Instant,
 
     let mut pop_count = 0;
     loop {
-        let mut c_t_status = t_status.clone();
+        //let mut c_t_status = t_status;
         if CLI.update_status {
-            t_status.lock().unwrap().set_state(&format!("wait at pop: {}", pop_count));
+            t_status.set_state(&format!("wait at pop: nodes: {}", pop_count));
         }
         match out_q.pop() {
             Some(list) => {
-                pop_count+=1;
+                pop_count += list.len();
                 if CLI.update_status {
-                    t_status.lock().unwrap().set_state(&format!("perking pop: {}", pop_count));
+                    t_status.set_state(&format!("perking pop: {}", pop_count));
                 }
 
                 count.fetch_add(list.len(), Ordering::Relaxed);
                 if CLI.usage_mode {
                     if CLI.update_status {
-                        t_status.lock().unwrap().set_state("recording stats");
+                        t_status.set_state("recording stats");
                     }
                     perk_up_disk_usage(stats, &list)?;
                 }
@@ -573,7 +545,7 @@ fn file_track(startout: Instant,
                         let f_age = md.modified()?;
                         if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
                             if CLI.write_thread_status {
-                                t_status.lock().unwrap().set_state("writing meta data");
+                                t_status.set_state("writing meta data");
                             }
                             write_meta(&path, &md)?
                         }
@@ -584,7 +556,7 @@ fn file_track(startout: Instant,
         }
     }
     if CLI.update_status {
-        t_status.lock().unwrap().set_state(&format!("perking {} entries", stats.dtree.len()));
+        t_status.set_state(&format!("perking {} entries", stats.dtree.len()));
     }
     let last_count = count.load(Ordering::Relaxed);
     count.store(0, Ordering::Relaxed);
@@ -608,13 +580,13 @@ fn file_track(startout: Instant,
             track_top_n_ext(&mut stats.top_ext, &x.0, *x.1, CLI.limit);
         }
         if CLI.update_status {
-            t_status.lock().unwrap().set_state("print");
+            t_status.set_state("print");
         }
         print_disk_report(&stats);
         eprintln!("perk cpu time: {}", track_cpu_time.elapsed().as_secs_f32());
     }
     if CLI.update_status {
-        t_status.lock().unwrap().set_state("exit");
+        t_status.set_state("exit");
     }
     if CLI.write_thread_cpu_time {
         eprintln!("file track thread cpu time: {:.3}", t_cpu_thread_time.elapsed().as_secs_f64());
@@ -652,7 +624,8 @@ fn print_disk_report(stats: &AllStats) {
         count: u64,
         size: u64,
         uid: u32,
-    };
+    }
+    ;
     {
         let mut user_vec: Vec<U2u> = stats.user_map.iter().map(|(&x, &y)| U2u { count: y.0, size: y.1, uid: x }).collect();
         user_vec.sort_by(|b, a| a.size.cmp(&b.size).then(b.uid.cmp(&b.uid)));
@@ -740,7 +713,9 @@ fn parls() -> Result<()> {
         total_usage: 0u64,
     };
 
-    let mut thread_status: BTreeMap<usize, Arc<Mutex<ThreadStatus>>> = BTreeMap::new();
+    let mut tt = ThreadTracker::new();
+    let mut main_status = tt.setup_thread("main", "setup");
+    main_status.register("registered");
 
     q.push(Some(CLI.dir.to_path_buf())).with_context(|| format!("Cannot push top path: {}", CLI.dir.display()))?;
     let startout = Instant::now();
@@ -750,44 +725,31 @@ fn parls() -> Result<()> {
     for i in 0..CLI.no_threads {
         let mut q = q.clone();
         let mut oq = oq.clone();
-        let mut t_status = Arc::new(Mutex::new(ThreadStatus::new("NA", "read_dir")));
-        let mut c_t_status = t_status.clone();
-        thread_status.insert(thread_status.len(), t_status);
-        let h = spawn(move || read_dir_thread(&mut q, &mut oq, &mut c_t_status));
+        let mut t_status = tt.setup_thread("read_dir", "starting...");
+        //let mut c_t_status = t_status.clone();
+        let h = spawn(move || read_dir_thread(&mut q, &mut oq, &mut t_status));
         handles.push(h);
     }
 
     let w_h = {
         let mut c_oq = oq.clone();
         let mut c_q = q.clone();
-        let mut ft_status = Arc::new(Mutex::new(ThreadStatus::new("NA", "file_trk")));
-        let mut c_ft_status = ft_status.clone();
-        thread_status.insert(thread_status.len(), ft_status);
-        spawn(move || file_track(startout, startcpu, &mut allstats, &mut c_oq, &mut c_q, c_ft_status))
+        let mut ft_status = tt.setup_thread("file_trk", "starting...");
+        //let mut c_ft_status = ft_status.clone();
+        spawn(move || file_track(startout, startcpu, &mut allstats, &mut c_oq, &mut c_q, &mut ft_status))
     };
 
+    main_status.set_state("monitor started");
     if CLI.write_thread_status_on_enter_key || CLI.write_thread_status {
         thread::spawn(move || {
-            let mut buff = String::new();
-            loop {
-                let mut last = 0;
-                let start_f = Instant::now();
-
-                if CLI.write_thread_status_on_enter_key {
-                    let mut buff = String::new();
-                    std::io::stdin().read_line(&mut buff);
-                } else if CLI.write_thread_status {
-                    thread::sleep(Duration::from_millis(CLI.ticker_interval));
-                }
-
-                for (i, ts) in thread_status.iter() {
-                    let ts_x = ts.lock().unwrap();
-                    eprintln!("index: {:2} {}  tid:  {:6}  status: \"{}\"", i, &ts_x.name, &ts_x.tid, &ts_x.state);
-                }
-                eprintln!();
+            if CLI.write_thread_status_on_enter_key {
+                tt.monitor_on_enter();
+            } else if CLI.write_thread_status {
+                tt.monitor(CLI.ticker_interval);
             }
         });
     }
+
 
     match (CLI.list_files, CLI.usage_mode) {
         (true, true) => println!("List file stats and disk usage summary for: {}", CLI.dir.display()),
@@ -795,6 +757,8 @@ fn parls() -> Result<()> {
         (true, false) => println!("List file stats under: {}", CLI.dir.display()),
         _ => Err(anyhow!("Error - neither usage or list mode specified"))?,
     }
+    main_status.set_state("wait on queue finish");
+
     let n_threads = CLI.no_threads;
     loop {
         let x = q.wait_for_finish_timeout(Duration::from_millis(250))?;
@@ -803,10 +767,12 @@ fn parls() -> Result<()> {
     }
     if CLI.verbose > 0 { q.print_max_queue(); }
     if CLI.verbose > 0 { eprintln!("finished so sends the Nones and join"); }
+    main_status.set_state("joining");
     for _ in 0..CLI.no_threads { q.push(None); }
     for h in handles {
         h.join();
     }
+    main_status.set_state("output queue wait");
     if CLI.verbose > 0 { eprintln!("waiting on out finish"); }
     oq.wait_for_finish()?;
     if CLI.verbose > 0 { eprintln!("push none of out queue"); }
