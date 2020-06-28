@@ -14,7 +14,7 @@ fn main() {
 }
 
 fn _main() -> Result<()> {
-    let no_workers = 4;
+    let no_workers = 32;
 
     let mut q: WorkerQueue<Option<usize>> = WorkerQueue::new(no_workers, 200);
     q.push(Some(1000000));
@@ -32,8 +32,9 @@ fn _main() -> Result<()> {
                     Some(s) => {
                         c += 1;
                         let n = s - 1;
-                        if n % 30000 == 0 {
-                            println!("at {}", n);
+                        if n % 100000 == 0 {
+                            let stats = q_c.get_stats();
+                            println!("at {} len: {}", n, &stats.curr_q_len);
                         }
                         if n > 0 {
                             q_c.push(Some(n));
@@ -43,7 +44,7 @@ fn _main() -> Result<()> {
                     }
                 }
             }
-            println!("quiting... worker {}", c);
+            println!("quiting... worker {}", _t);
         });
         handles.push(h);
     }

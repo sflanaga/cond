@@ -28,7 +28,9 @@ pub struct QueueStats {
     pub curr_pushers: usize,
     pub curr_q_len: usize,
 }
-
+//
+// unbounded queue (aka limit of 0) is known to work well - much simpler
+//
 impl<T> WorkerQueue<T> {
     pub fn new(max_waits: usize, limit_: usize) -> WorkerQueue<T> {
         WorkerQueue {
@@ -48,80 +50,81 @@ impl<T> WorkerQueue<T> {
         }
     }
     pub fn push(&mut self, item: T) -> Result<()> {
-        let mut l = self.tqueue.lock().unwrap();
-        l.curr_pushers += 1;
-        if l.queue.len() > l.max_q_len_reached {
-            l.max_q_len_reached = l.queue.len();
+        let mut lck_q = self.tqueue.lock().unwrap();
+        lck_q.curr_pushers += 1;
+        if lck_q.queue.len() > lck_q.max_q_len_reached {
+            lck_q.max_q_len_reached = lck_q.queue.len();
         }
-        if l.limit == 0 {
-            l.queue.push_front(item);
+        if lck_q.limit == 0 {
+            lck_q.queue.push_front(item);
         } else {
-            if l.limit <= l.queue.len() && l.curr_pushers >= l.max_waiters {
-                l.dead += 1;
+            if lck_q.limit <= lck_q.queue.len() && lck_q.curr_pushers >= lck_q.max_waiters {
+                lck_q.dead += 1;
                 self.looks_done.notify_all();
-                Err(anyhow!("Queue overflow reached - cannot push another, len at {} and this is the {}(th) pusher", l.queue.len(), l.curr_pushers))?;
+                Err(anyhow!("Queue overflow reached - cannot push another, len at {} and this is the {}(th) pusher",
+                lck_q.queue.len(), lck_q.curr_pushers))?;
             }
-            while l.limit > 0 && l.queue.len() >= l.limit {
-                l = self.cond_hasroom.wait(l).unwrap();
+            while lck_q.limit > 0 && lck_q.queue.len() >= lck_q.limit {
+                lck_q = self.cond_hasroom.wait(lck_q).unwrap();
             }
-            l.queue.push_front(item);
+            lck_q.queue.push_front(item);
         }
-        l.curr_pushers -= 1;
+        lck_q.curr_pushers -= 1;
         self.cond_more.notify_one();
         Ok(())
     }
     pub fn pop(&mut self) -> T {
-        let mut l = self.tqueue.lock().unwrap();
-        l.curr_poppers += 1;
-        while l.queue.len() < 1 {
-            if l.curr_poppers == l.max_waiters {
+        let mut lck_q = self.tqueue.lock().unwrap();
+        lck_q.curr_poppers += 1;
+        while lck_q.queue.len() < 1 {
+            if lck_q.curr_poppers == lck_q.max_waiters {
                 self.looks_done.notify_one();
             }
-            l = self.cond_more.wait(l).unwrap();
+            lck_q = self.cond_more.wait(lck_q).unwrap();
         }
-        let res = l.queue.pop_back().unwrap();
+        let res = lck_q.queue.pop_back().unwrap();
         self.cond_hasroom.notify_one();
-        l.curr_poppers -= 1;
+        lck_q.curr_poppers -= 1;
         res
     }
     pub fn waiters(&self) -> usize {
-        let l = self.tqueue.lock().unwrap();
-        l.curr_poppers
+        let lck_q = self.tqueue.lock().unwrap();
+        lck_q.curr_poppers
     }
 
     pub fn wait_for_finish_timeout(&self, dur: Duration) -> Result<i64> {
-        let ret= {
-            let mut l = self.tqueue.lock().unwrap();
+        let ret = {
+            let mut lck_q = self.tqueue.lock().unwrap();
             // sanity check because we have more new work than the queue can hold
-            while !(l.queue.len() <= 0 && l.curr_poppers == l.max_waiters) {
-                let x = self.looks_done.wait_timeout(l, dur).unwrap();
-                l = x.0;
+            while !(lck_q.queue.len() <= 0 && lck_q.curr_poppers == lck_q.max_waiters) {
+                let x = self.looks_done.wait_timeout(lck_q, dur).unwrap();
+                lck_q = x.0;
                 if x.1.timed_out() {
                     return Ok(-1);
                 }
-                if l.limit != 0 && l.curr_pushers >= l.max_waiters && l.queue.len() >= (l.limit) {
-                    Err(anyhow!("Queue looks stuck at limit {} and pushers {}", &l.queue.len(), &l.curr_pushers))?;
+                if lck_q.limit != 0 && lck_q.curr_pushers >= lck_q.max_waiters && lck_q.queue.len() >= (lck_q.limit) {
+                    Err(anyhow!("Queue looks stuck at limit {} and pushers {}", &lck_q.queue.len(), &lck_q.curr_pushers))?;
                 }
-                if l.dead > 0 {
-                    Err(anyhow!("Thread death detected - likely due to overflow, #dead: {}", l.dead))?;
+                if lck_q.dead > 0 {
+                    Err(anyhow!("Thread death detected - likely due to overflow, #dead: {}", &lck_q.dead))?;
                 }
             }
-            l.curr_poppers as i64
+            lck_q.curr_poppers as i64
         };
 
         Ok(ret)
     }
 
     pub fn wait_for_finish(&self) -> Result<usize> {
-        let mut l = self.tqueue.lock().unwrap();
+        let mut lck_q = self.tqueue.lock().unwrap();
         // sanity check because we have more new work than the queue can hold
-        if l.limit > 0 && l.curr_pushers >= l.max_waiters && l.queue.len() >= l.limit {
-            Err(anyhow!("Queue looks stuck at limit {} and waiters {}", &l.queue.len(), &l.curr_poppers))?;
+        if lck_q.limit > 0 && lck_q.curr_pushers >= lck_q.max_waiters && lck_q.queue.len() >= lck_q.limit {
+            Err(anyhow!("Queue looks stuck at limit {} and waiters {}", &lck_q.queue.len(), &lck_q.curr_poppers))?;
         }
-        while !(l.queue.len() <= 0 && l.curr_poppers >= l.max_waiters) {
-            l = self.looks_done.wait(l).unwrap();
+        while !(lck_q.queue.len() <= 0 && lck_q.curr_poppers >= lck_q.max_waiters) {
+            lck_q = self.looks_done.wait(lck_q).unwrap();
         }
-        Ok(l.curr_poppers)
+        Ok(lck_q.curr_poppers)
     }
 
     pub fn notify_all(&self) {
@@ -130,20 +133,22 @@ impl<T> WorkerQueue<T> {
     }
 
     pub fn status(&self) {
-        let l = self.tqueue.lock().unwrap();
-        eprintln!("q len: {}  threads:  {}  dead:  {}  poppers: {}  pushers: {}", l.queue.len(), l.max_waiters, l.dead, l.curr_poppers, l.curr_pushers);
+        let lck_q = self.tqueue.lock().unwrap();
+        eprintln!("q len: {}  threads:  {}  dead:  {}  poppers: {}  pushers: {}",
+                  lck_q.queue.len(), lck_q.max_waiters, lck_q.dead,
+                  lck_q.curr_poppers, lck_q.curr_pushers);
     }
     pub fn print_max_queue(&self) {
-        let l = self.tqueue.lock().unwrap();
-        eprintln!("max q reached: {}", l.max_q_len_reached);
+        let lck_q = self.tqueue.lock().unwrap();
+        eprintln!("max q reached: {}", lck_q.max_q_len_reached);
     }
 
     pub fn get_stats(&self) -> QueueStats {
-        let l = self.tqueue.lock().unwrap();
+        let lck_q = self.tqueue.lock().unwrap();
         QueueStats {
-            curr_pushers: l.curr_pushers,
-            curr_poppers: l.curr_poppers,
-            curr_q_len: l.queue.len()
+            curr_pushers: lck_q.curr_pushers,
+            curr_poppers: lck_q.curr_poppers,
+            curr_q_len: lck_q.queue.len(),
         }
     }
 }
