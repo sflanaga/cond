@@ -1,27 +1,10 @@
-use std::time::Duration;
-use anyhow::{Context, Result};
-use std::path::Path;
-use std::borrow::Cow;
+#![allow(dead_code)]
 
-pub fn dur_from_str(s: &str) -> Result<Duration> {
-    let mut _tmp = String::new();
-    let mut tot_secs = 0u64;
-    for c in s.chars() {
-        if c >= '0' && c <= '9' { _tmp.push(c); } else {
-            tot_secs += match c {
-                's' => _tmp.parse::<u64>()?,
-                'm' => _tmp.parse::<u64>()? * 60,
-                'h' => _tmp.parse::<u64>()? * 3600,
-                'd' => _tmp.parse::<u64>()? * 24 * 3600,
-                'w' => _tmp.parse::<u64>()? * 24 * 3600 * 7,
-                'y' => _tmp.parse::<u64>()? * 24 * 3600 * 365,
-                _ => panic!("char {} not understood", c),
-            };
-            _tmp.clear();
-        }
-    }
-    Ok(Duration::from_secs(tot_secs))
-}
+use std::borrow::Cow;
+use std::path::Path;
+use std::time::Duration;
+
+use anyhow::Result;
 
 // Cow here let's us not allocate in the common case
 pub fn multi_extension(p: & Path) -> Option<Cow<str>> {

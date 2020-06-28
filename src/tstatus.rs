@@ -1,8 +1,7 @@
 use std::sync::{Arc, Mutex};
-use num_cpus::get;
 use std::thread;
 use std::time::Duration;
-use std::path::Iter;
+use anyhow::{Context, anyhow, Result};
 
 #[cfg(target_os = "windows")]
 pub fn gettid() -> usize {
@@ -80,38 +79,12 @@ impl ThreadTracker {
     pub fn monitor_on_enter(&self) {
         loop {
             let mut buff = String::new();
-            std::io::stdin().read_line(&mut buff);
+            if std::io::stdin().read_line(&mut buff).is_err() {
+                eprintln!("Unable to read line for user thread status cue");
+                return;
+            };
             self.eprint_status();
         }
     }
 
-    pub fn iter(&self) -> std::slice::Iter<ThreadStatus> { self.list.iter() }
 }
-
-/*
-pub trait SafeThreadStatus: Clone {
-    fn set_state(&mut self, s: &str);
-    fn register(&mut self, state: &str);
-}
-
-impl SafeThreadStatus for Arc<Mutex<ThreadStatus>> {
-    fn set_state(&mut self, s: &str) {
-        self.lock().unwrap().state = s.into();
-    }
-    fn register(&mut self, state: &str) {
-        let mut l = self.lock().unwrap();
-        l.state = state.into();
-        l.tid = gettid();
-    }
-}
-
-
-struct Athing(Arc<Mutex<String>>);
-
-impl Athing {
-    fn new(state: &str) -> Athing {
-        Athing(Arc::new(Mutex::new(state.into())))
-    }
-    fn there() {}
-}
-*/

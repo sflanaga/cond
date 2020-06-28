@@ -1,43 +1,39 @@
-mod tstatus;
+#![allow(unused_imports)]
 
+use std::cmp::max;
+use std::collections::{BinaryHeap, BTreeMap};
+use std::fs::{FileType, Metadata, symlink_metadata};
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(target_family = "windows")]
+use std::os::windows::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::thread::spawn;
 use std::time::{Duration, Instant};
-use structopt::StructOpt;
-
-mod worker_queue;
-
-use worker_queue::*;
-use std::path::{PathBuf, Path};
-use std::fs::{metadata, read_dir, symlink_metadata, Metadata, FileType};
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[cfg(target_family = "unix")]
-use std::os::unix::fs::{PermissionsExt, MetadataExt};
-
-#[cfg(target_family = "unix")]
-use users::{get_user_by_uid, get_current_uid};
-
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::{MetadataExt};
-
-
-use lazy_static::lazy_static;
-use std::thread;
-use std::sync::{Arc, Mutex, MutexGuard};
-
-
-use anyhow::{Context, anyhow, Result};
 use std::time::SystemTime;
-use std::collections::{LinkedList, BTreeMap, BinaryHeap, BTreeSet};
 
-mod util;
-
-use util::{mem_metric_digit, dur_from_str, greek, gettid};
-use std::borrow::{Borrow, Cow};
-use std::cmp::max;
 use cpu_time::ProcessTime;
+use structopt::StructOpt;
+#[cfg(target_family = "unix")]
+use users::{get_current_uid, get_user_by_uid};
+
+use anyhow::{anyhow, Context, Result};
+use lazy_static::lazy_static;
+use util::greek;
+use worker_queue::*;
+
+use crate::tstatus::{ThreadStatus, ThreadTracker};
 use crate::util::multi_extension;
-use crate::tstatus::{ThreadTracker, ThreadStatus};
+use crate::cli::{CLI,EXE};
+
+mod tstatus;
+mod worker_queue;
+mod util;
+mod cli;
+
 
 fn main() {
     if let Err(err) = parls() {
@@ -46,127 +42,8 @@ fn main() {
     }
 }
 
-#[derive(StructOpt, Debug, Clone)]
-#[structopt(
-global_settings(& [structopt::clap::AppSettings::ColoredHelp, structopt::clap::AppSettings::VersionlessSubcommands, structopt::clap::AppSettings::DeriveDisplayOrder]),
-//raw(setting = "structopt::clap::AppSettings::DeriveDisplayOrder"),
-author, about
-)]
-///
-/// Perform a sql-like group by on csv or arbitrary text files organized into lines.  You can use multiple regex entries to attempt to capture a record across multiple lines such as xml files, but this is very experiemental.
-///
-pub struct ParLsCfg {
-    #[structopt(name = "DIRECTORY", parse(try_from_str = dir_check))]
-    /// A list of directories to walk
-    pub dir: PathBuf,
 
-    #[structopt(short = "u", long = "usage_trees")]
-    /// Disk usage mode - do not write the files found
-    pub usage_mode: bool,
-
-    #[structopt(short = "l", name = "list_files")]
-    /// Report top usage limit
-    pub list_files: bool,
-
-    #[structopt(short = "n", name = "top_n_limit", default_value("15"))]
-    /// Report top usage limit
-    pub limit: usize,
-
-    #[structopt(short = "d", long = "delimiter", default_value("|"))]
-    /// Disk usage mode - do not write the files found
-    pub delimiter: char,
-
-    #[structopt(short = "t", long = "worker_threads", default_value("0"))]
-    /// Number worker threads
-    ///
-    /// defaults to 0 which means # of cpus or at least 4
-    /// Latency vs throughput:
-    /// The theory here is that parallel listing overcomes latency issues
-    /// by having multiple requests in play at once, and is not cpu bound.
-    pub no_threads: usize,
-
-    #[structopt(short = "q", long = "queue_limit", default_value("0"))]
-    /// Limit of the queue size so that we do not get too greedy with memory - 0 means no limit
-    pub queue_limit: usize,
-
-    #[structopt(short = "v", parse(from_occurrences))]
-    /// Verbosity - use more than one v for greater detail
-    pub verbose: usize,
-
-    #[structopt(short = "i", long = "ticker_interval", default_value("200"))]
-    /// Interval at which stats are written - 0 means no ticker is run
-    pub ticker_interval: u64,
-
-    #[structopt(long = "progress")]
-    /// Writes progress stats on every ticker interval
-    pub progress: bool,
-
-    #[structopt(long = "write_thread_status", conflicts_with("write_thread_status_on_enter_key"))]
-    /// Writes thread status every ticker interval - used to debug things
-    pub write_thread_status: bool,
-
-    #[structopt(long = "write_thread_status_on_enter_key", conflicts_with("write_thread_status"))]
-    /// Writes thread status when stdin sees a line entered by user
-    pub write_thread_status_on_enter_key: bool,
-
-    #[structopt(long = "file_newer_than", parse(try_from_str = parse_timespec))]
-    /// Only count/sum entries newer than this age
-    pub file_newer_than: Option<SystemTime>,
-
-    #[structopt(long = "file_older_than", parse(try_from_str = parse_timespec))]
-    /// Only count/sum entries older than this age
-    pub file_older_than: Option<SystemTime>,
-
-    #[structopt(long = "write_thread_cpu_time")]
-    /// write cpu time consumed by each thread
-    pub write_thread_cpu_time: bool,
-
-    #[structopt(skip)]
-    pub update_status: bool,
-}
-
-fn parse_timespec(str: &str) -> Result<SystemTime> {
-    let dur = dur_from_str(str)?;
-    let ret = SystemTime::now() - dur;
-    Ok(ret)
-}
-
-fn dir_check(s: &str) -> Result<PathBuf> {
-    let p = PathBuf::from(s);
-
-    let m = symlink_metadata(&p).with_context(|| format!("path specified: {}", s))?;
-    if !m.is_dir() {
-        return Err(anyhow!("{} not a directory", s));
-    }
-
-    Ok(p)
-}
-
-lazy_static! {
-    static ref CLI: ParLsCfg = {
-       get_cli()
-    };
-    static ref EXE: String = get_exe_name();
-}
-
-fn get_cli() -> ParLsCfg {
-    let mut cfg = ParLsCfg::from_args();
-    if cfg.no_threads == 0 {
-        cfg.no_threads = max(num_cpus::get(), 4);
-    }
-    if !cfg.usage_mode && !cfg.list_files {
-        cfg.usage_mode = true;
-    }
-    if cfg.write_thread_status_on_enter_key || cfg.write_thread_status {
-        cfg.update_status = true;
-    }
-    cfg
-}
-
-fn get_exe_name() -> String {
-    std::env::args().nth(0).unwrap()
-}
-
+//noinspection ALL
 fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut ThreadStatus) {
     // get back to work slave loop....
     let t_cpu_time = cpu_time::ThreadTime::now();
@@ -185,6 +62,7 @@ fn read_dir_thread(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQ
     }
 }
 
+//noinspection ALL
 fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut WorkerQueue<Option<Vec<(PathBuf, Metadata)>>>, t_status: &mut ThreadStatus) -> Result<()> {
     let mut pops_done = 0;
     t_status.register("started");
@@ -250,7 +128,7 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
                     t_status.set_state(&format!("pushing {} dirs and at {} pops", other_dirs.len(), pops_done));
                 }
                 for d in other_dirs {
-                    queue.push(Some(d));
+                    queue.push(Some(d))?;
                 }
             }
         }
@@ -261,6 +139,9 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
     Ok(())
 }
 
+// TODO: add username and or id
+// get windows user id / name?  how?  up to snuff here with unix
+
 #[cfg(target_family = "unix")]
 fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
     let file_type = match meta.file_type() {
@@ -269,9 +150,32 @@ fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
         x if x.is_symlink() => 's',
         _ => 'N',
     };
-    println!("{}{}{}{}{}{}{:o}{}{}{}{}", file_type, CLI.delimiter, path.to_string_lossy(),
-             CLI.delimiter, meta.size(), CLI.delimiter, meta.permissions().mode(), CLI.delimiter,
-             meta.uid(), CLI.delimiter, meta.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs());
+    match get_user_by_uid(meta.uid()) {
+        None => {
+            println!("{}{}{}{}{}{}{:o}{}{}{}{}", file_type, CLI.delimiter, path.to_string_lossy(),
+                     CLI.delimiter, meta.size(), CLI.delimiter, meta.permissions().mode(), CLI.delimiter,
+                     meta.uid(), CLI.delimiter, meta.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs());
+        }
+        Some(user) => {
+            println!("{}{}{}{}{}{}{:o}{}{}{}{}", file_type, CLI.delimiter, path.to_string_lossy(),
+                     CLI.delimiter, meta.size(), CLI.delimiter, meta.permissions().mode(), CLI.delimiter,
+                     user.name().to_string_lossy(), CLI.delimiter, meta.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs());
+        }
+    };
+    Ok(())
+}
+
+#[cfg(target_family = "windows")]
+fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
+    let file_type = match meta.file_type() {
+        x if x.is_file() => 'f',
+        x if x.is_dir() => 'd',
+        x if x.is_symlink() => 's',
+        _ => 'N',
+    };
+    println!("{}{}{}{}{}{}{}{}{}", file_type, CLI.delimiter, path.display(),
+             CLI.delimiter, meta.len(), CLI.delimiter, meta.permissions().readonly(), CLI.delimiter,
+             meta.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs());
     Ok(())
 }
 
@@ -361,44 +265,36 @@ struct AllStats {
     total_usage: u64,
 }
 
-fn track_top_n_ext(heap: &mut BinaryHeap<TrackedExtension>, ext: &String, s: u64, limit: usize) -> Result<bool> {
-    if s == 0 { return Ok(false); }
-
+//noinspection ALL
+fn track_top_n_ext(heap: &mut BinaryHeap<TrackedExtension>, ext: &String, s: u64, limit: usize) {
     if limit > 0 {
         if heap.len() < limit {
             heap.push(TrackedExtension { size: s, extension: ext.clone() });
-            return Ok(true);
+            return;
         } else if heap.peek().expect("internal error: cannot peek when the size is greater than 0!?").size < s {
             heap.pop();
             heap.push(TrackedExtension { size: s, extension: ext.clone() });
-            return Ok(true);
+            return;
         }
     }
-    Ok(false)
 }
 
-fn track_top_n(heap: &mut BinaryHeap<TrackedPath>, p: &PathBuf, s: u64, limit: usize) -> Result<bool> {
-    if s == 0 { return Ok(false); }
+//noinspection ALL
+fn track_top_n(heap: &mut BinaryHeap<TrackedPath>, p: &PathBuf, s: u64, limit: usize) {
 
     if limit > 0 {
         if heap.len() < limit {
             heap.push(TrackedPath { size: s, path: p.clone() });
-            return Ok(true);
+            return;
         } else if heap.peek().expect("internal error: cannot peek when the size is greater than 0!?").size < s {
             heap.pop();
             heap.push(TrackedPath { size: s, path: p.clone() });
-            return Ok(true);
+            return;
         }
     }
-    Ok(false)
 }
 
-#[cfg(target_family = "windows")]
-fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
-    println!("{}{}{}", path.canonicalize()?.display(), CLI.delimiter, meta.len());
-    Ok(())
-}
-
+//noinspection ALL
 fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Result<()> {
     if list.len() > 0 {
         if let Some(mut parent) = list[0].0.ancestors().skip(1).next() {
@@ -454,7 +350,7 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
             };
             // go up tree and add stuff
             loop {
-                if let Some(mut nextpar) = parent.ancestors().skip(1).next() {
+                if let Some(nextpar) = parent.ancestors().skip(1).next() {
                     if parent == CLI.dir { break; }
 
                     if nextpar == parent {
@@ -482,6 +378,7 @@ fn perk_up_disk_usage(top: &mut AllStats, list: &Vec<(PathBuf, Metadata)>) -> Re
     Ok(())
 }
 
+//noinspection ALL
 fn file_track(startout: Instant,
               cputime: ProcessTime,
               stats: &mut AllStats,
@@ -544,7 +441,7 @@ fn file_track(startout: Instant,
                     for (path, md) in list {
                         let f_age = md.modified()?;
                         if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
-                            if CLI.write_thread_status {
+                            if CLI.t_status_interval {
                                 t_status.set_state("writing meta data");
                             }
                             write_meta(&path, &md)?
@@ -594,6 +491,7 @@ fn file_track(startout: Instant,
     Ok(())
 }
 
+//noinspection ALL
 fn to_sort_vec(heap: &BinaryHeap<TrackedPath>) -> Vec<TrackedPath> {
     let mut v = Vec::with_capacity(heap.len());
     for i in heap {
@@ -606,6 +504,7 @@ fn to_sort_vec(heap: &BinaryHeap<TrackedPath>) -> Vec<TrackedPath> {
     v
 }
 
+//noinspection ALL
 fn to_sort_vec_file_ext(heap: &BinaryHeap<TrackedExtension>) -> Vec<TrackedExtension> {
     let mut v = Vec::with_capacity(heap.len());
     for i in heap {
@@ -618,6 +517,7 @@ fn to_sort_vec_file_ext(heap: &BinaryHeap<TrackedExtension>) -> Vec<TrackedExten
     v
 }
 
+//noinspection ALL
 fn print_disk_report(stats: &AllStats) {
     #[derive(Debug)]
     struct U2u {
@@ -625,22 +525,20 @@ fn print_disk_report(stats: &AllStats) {
         size: u64,
         uid: u32,
     }
-    ;
-    {
-        let mut user_vec: Vec<U2u> = stats.user_map.iter().map(|(&x, &y)| U2u { count: y.0, size: y.1, uid: x }).collect();
-        user_vec.sort_by(|b, a| a.size.cmp(&b.size).then(b.uid.cmp(&b.uid)));
-        //println!("File space scanned: {} and {} files in {} seconds", greek(total as f64), count, sec);
-        if !user_vec.is_empty() {
-            println!("\nSpace/file-count per user");
-            for ue in &user_vec {
-                #[cfg(target_family = "unix")]
-                match get_user_by_uid(ue.uid) {
-                    None => println!("uid{:7} {} / {}", ue.uid, greek(ue.size as f64), ue.count),
-                    Some(user) => println!("{:10} {} / {}", user.name().to_string_lossy(), greek(ue.size as f64), ue.count),
-                }
-                #[cfg(target_family = "windows")]
-                println!("uid{:>7} {} / {}", ue.uid, greek(ue.size as f64), ue.count);
+
+    let mut user_vec: Vec<U2u> = stats.user_map.iter().map(|(&x, &y)| U2u { count: y.0, size: y.1, uid: x }).collect();
+    user_vec.sort_by(|b, a| a.size.cmp(&b.size).then(b.uid.cmp(&b.uid)));
+    //println!("File space scanned: {} and {} files in {} seconds", greek(total as f64), count, sec);
+    if !user_vec.is_empty() {
+        println!("\nSpace/file-count per user");
+        for ue in &user_vec {
+            #[cfg(target_family = "unix")]
+            match get_user_by_uid(ue.uid) {
+                None => println!("uid{:7} {} / {}", ue.uid, greek(ue.size as f64), ue.count),
+                Some(user) => println!("{:10} {} / {}", user.name().to_string_lossy(), greek(ue.size as f64), ue.count),
             }
+            #[cfg(target_family = "windows")]
+            println!("uid{:>7} {} / {}", ue.uid, greek(ue.size as f64), ue.count);
         }
     }
     if !stats.top_dir.is_empty() {
@@ -694,6 +592,7 @@ fn print_disk_report(stats: &AllStats) {
 }
 
 
+//noinspection ALL
 fn parls() -> Result<()> {
     if CLI.verbose > 0 { eprintln!("CLI: {:#?}", *CLI); }
     let mut q: WorkerQueue<Option<PathBuf>> = WorkerQueue::new(CLI.no_threads, CLI.queue_limit);
@@ -722,7 +621,7 @@ fn parls() -> Result<()> {
     let startcpu = ProcessTime::now();
 
     let mut handles = vec![];
-    for i in 0..CLI.no_threads {
+    for _i in 0..CLI.no_threads {
         let mut q = q.clone();
         let mut oq = oq.clone();
         let mut t_status = tt.setup_thread("read_dir", "starting...");
@@ -740,11 +639,11 @@ fn parls() -> Result<()> {
     };
 
     main_status.set_state("monitor started");
-    if CLI.write_thread_status_on_enter_key || CLI.write_thread_status {
+    if CLI.t_status_on_key || CLI.t_status_interval {
         thread::spawn(move || {
-            if CLI.write_thread_status_on_enter_key {
+            if CLI.t_status_on_key {
                 tt.monitor_on_enter();
-            } else if CLI.write_thread_status {
+            } else if CLI.t_status_interval {
                 tt.monitor(CLI.ticker_interval);
             }
         });
@@ -759,7 +658,6 @@ fn parls() -> Result<()> {
     }
     main_status.set_state("wait on queue finish");
 
-    let n_threads = CLI.no_threads;
     loop {
         let x = q.wait_for_finish_timeout(Duration::from_millis(250))?;
         if x != -1 { break; }
@@ -768,9 +666,9 @@ fn parls() -> Result<()> {
     if CLI.verbose > 0 { q.print_max_queue(); }
     if CLI.verbose > 0 { eprintln!("finished so sends the Nones and join"); }
     main_status.set_state("joining");
-    for _ in 0..CLI.no_threads { q.push(None); }
+    for _ in 0..CLI.no_threads { q.push(None)?; }
     for h in handles {
-        h.join();
+        h.join().expect("Cannot join a readdir thread");
     }
     main_status.set_state("output queue wait");
     if CLI.verbose > 0 { eprintln!("waiting on out finish"); }
@@ -778,7 +676,7 @@ fn parls() -> Result<()> {
     if CLI.verbose > 0 { eprintln!("push none of out queue"); }
     oq.push(None)?;
     if CLI.verbose > 0 { eprintln!("joining out thread"); }
-    w_h.join();
+    w_h.join().expect("cannot join a output thread")?;
 
 
     println!("last cpu time: {}", startcpu.elapsed().as_secs_f32());

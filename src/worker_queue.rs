@@ -1,8 +1,11 @@
-use std::sync::{Arc, Mutex, Condvar};
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 use std::collections::LinkedList;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 struct InnerQ<T> {
     queue: LinkedList<T>,

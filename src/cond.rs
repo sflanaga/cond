@@ -1,3 +1,5 @@
+mod cli;
+
 use std::thread::spawn;
 use std::time::Duration;
 
