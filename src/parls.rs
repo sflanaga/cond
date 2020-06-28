@@ -197,6 +197,20 @@ fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
+fn write_meta_header() {
+    println!("{}{}{}{}{}{}{}{}{}{}{}", "type", CLI.delimiter, "path",
+             CLI.delimiter, "size", CLI.delimiter, "permissions", CLI.delimiter,
+             "user", CLI.delimiter,
+             "epoch_last_modification");
+}
+
+#[cfg(target_family = "windows")]
+fn write_meta_header() {
+    println!("{}{}{}{}{}{}{}{}{}", "type", CLI.delimiter, "path",
+             CLI.delimiter, "size", CLI.delimiter, "readonly", CLI.delimiter,
+             "epoch_last_modification");
+}
 #[cfg(target_family = "windows")]
 fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
     let file_type = match meta.file_type() {
@@ -210,7 +224,6 @@ fn write_meta(path: &PathBuf, meta: &Metadata) -> Result<()> {
              meta.modified()?.duration_since(SystemTime::UNIX_EPOCH)?.as_secs());
     Ok(())
 }
-
 
 #[derive(Eq, Debug)]
 struct TrackedPath {
@@ -450,6 +463,10 @@ fn file_track(startout: Instant,
     }
 
     let mut pop_count = 0;
+    if CLI.list_files {
+        write_meta_header();
+    }
+
     loop {
         //let mut c_t_status = t_status;
         if CLI.update_status {
