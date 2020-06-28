@@ -99,12 +99,44 @@ fn _read_dir_worker(queue: &mut WorkerQueue<Option<PathBuf>>, out_q: &mut Worker
                         }
                         Ok(md) => md,
                     };
-                    if CLI.verbose > 2 {
+                    if CLI.verbose > 3 {
                         eprintln!("{}: raw meta: {:#?}", *EXE, &md);
                     }
+
+
                     let file_type: FileType = md.file_type();
                     if !file_type.is_symlink() {
                         if file_type.is_file() {
+                            //
+                            // re filters
+                            //
+                            if let Some(re) = &CLI.re {
+                                let s = path.to_str().unwrap();
+                                if !re.is_match(path.to_str().unwrap()) {
+                                    if CLI.verbose > 1 {
+                                        eprintln!("{}: filtered file not matching re: {}", *EXE, s);
+                                    }
+                                    continue;
+                                }
+                                if CLI.verbose > 1 {
+                                    eprintln!("{}: NOT filtered file DOES match re: {}", *EXE, s);
+                                }
+                            }
+                            if let Some(re) = &CLI.exclude_re {
+                                let s = path.to_str().unwrap();
+                                if re.is_match(path.to_str().unwrap()) {
+                                    if CLI.verbose > 1 {
+                                        eprintln!("{}: filtered path matching exclude_re: {}", *EXE, s);
+                                    }
+                                    continue;
+                                }
+                                if CLI.verbose > 1 {
+                                    eprintln!("{}: NOT filtered file DOES NOT match re: {}", *EXE, s);
+                                }
+                            }
+                            //
+                            // age filters
+                            //
                             let f_age = md.modified()?;
                             if CLI.file_newer_than.map_or(true, |x| x < f_age) && CLI.file_older_than.map_or(true, |x| x > f_age) {
                                 metalist.push((path.clone(), md.clone()));
@@ -595,7 +627,7 @@ fn print_disk_report(stats: &AllStats) {
 //noinspection ALL
 fn parls() -> Result<()> {
     if CLI.verbose > 0 { eprintln!("CLI: {:#?}", *CLI); }
-    let mut q: WorkerQueue<Option<PathBuf>> = WorkerQueue::new(CLI.no_threads, CLI.queue_limit);
+    let mut q: WorkerQueue<Option<PathBuf>> = WorkerQueue::new(CLI.no_threads, 0);
     let mut oq: WorkerQueue<Option<Vec<(PathBuf, Metadata)>>> = WorkerQueue::new(1, 0);
 
     let mut allstats = AllStats {

@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow, Context};
 use std::fs::symlink_metadata;
 use lazy_static::lazy_static;
 use std::cmp::max;
+use regex::Regex;
 
 lazy_static! {
     pub static ref CLI: ParLsCfg = {
@@ -19,22 +20,34 @@ lazy_static! {
 global_settings(& [structopt::clap::AppSettings::ColoredHelp, structopt::clap::AppSettings::VersionlessSubcommands, structopt::clap::AppSettings::DeriveDisplayOrder]),
 //raw(setting = "structopt::clap::AppSettings::DeriveDisplayOrder"),
 )]
-/// Parallel file system lister / Usage Statistics Summary
+/// Fast parallel file system lister / usage statistics summary
 ///
 /// A "recursive" listing of files and/or usage statistics summary is created.
 ///
 /// Latency vs throughput:
-/// The theory here is that parallel listing overcomes latency issues
-/// by having multiple requests in play at once, and is not cpu bound.
-/// This can overcome remote file system metadata throughput of a
-/// NAS via many simultaneous i/o requests.
+/// The theory here is that parallel listing overcomes latency issues on remote files systems
+/// by having multiple requests in play at once.  Usually remote file systems capable
+/// of good throughput will have higher latency than local file systems largely because
+/// the OS owns a faster and exclusive cache to local file system metadata.
 ///
-/// Also, of note is that each "opendir" is finished to completion so that
-/// the directory is left open for minimal amount of time, but this comes at a
-/// cost of significantly more memory.
+/// Each "opendir" is finished to completion so that
+/// the directory to minimize open time, but this costs more memory than straight recursion.
+/// This might also contribute to better performance as
+/// it may reduce contention on that remote file system versus holding the opendir open
+/// as you recurse a directory's children.  Sub directories found are queued for other
+/// threads to query to completion, and therefore because the number of directories may
+/// be large the queue grows unbounded.  The queue must be unbounded or a deadlock
+/// can occur as the worker is also a master (creator of new work).
+///
+/// Because in this application directories are evaluated in no particular order, it is necessary to
+/// aggregate lower directories up the tree containing ALL directories for usage summaries.
+/// This tree is the bulk of the memory used and is proportional to the tree directory count.
+///
+/// Symbolic links are not followed.
+///
 pub struct ParLsCfg {
     #[structopt(name = "DIRECTORY", parse(try_from_str = dir_check))]
-    /// A list of directories to walk
+    /// Directory to search
     pub dir: PathBuf,
 
     #[structopt(short = "u", long = "usage_trees")]
@@ -59,9 +72,27 @@ pub struct ParLsCfg {
     /// defaults to 0 which means # of cpus or at least 4
     pub no_threads: usize,
 
-    #[structopt(short = "q", long = "queue_limit", default_value("0"))]
-    /// Limit of the queue size so that we do not get too greedy with memory - 0 means no limit
-    pub queue_limit: usize,
+    #[structopt(long = "file_newer_than", parse(try_from_str = parse_timespec))]
+    /// Only count/sum entries newer than this age
+    pub file_newer_than: Option<SystemTime>,
+
+    #[structopt(long = "file_older_than", parse(try_from_str = parse_timespec))]
+    /// Only count/sum entries older than this age
+    pub file_older_than: Option<SystemTime>,
+
+    #[structopt(long = "re", parse(try_from_str = parse_regex))]
+    /// Keep only FILEs that match this RE
+    ///
+    /// Note that this can be used with the exclude_re, but this one
+    /// is checked first and then the other if set.
+    /// Note this only applies to FILE paths and not directories.
+    pub re: Option<Regex>,
+
+    #[structopt(long = "exclude_re", parse(try_from_str = parse_regex))]
+    /// Exclude FILEs that match this RE
+    ///
+    /// Note this only applies to FILEs paths and not directories.
+    pub exclude_re: Option<Regex>,
 
     #[structopt(short = "v", parse(from_occurrences))]
     /// Verbosity - use more than one v for greater detail
@@ -83,20 +114,16 @@ pub struct ParLsCfg {
     /// Writes thread status when stdin sees a line entered by user
     pub t_status_on_key: bool,
 
-    #[structopt(long = "file_newer_than", parse(try_from_str = parse_timespec))]
-    /// Only count/sum entries newer than this age
-    pub file_newer_than: Option<SystemTime>,
-
-    #[structopt(long = "file_older_than", parse(try_from_str = parse_timespec))]
-    /// Only count/sum entries older than this age
-    pub file_older_than: Option<SystemTime>,
-
     #[structopt(long = "write_thread_cpu_time")]
     /// write cpu time consumed by each thread
     pub write_thread_cpu_time: bool,
 
     #[structopt(skip)]
     pub update_status: bool,
+}
+
+fn parse_regex(str: &str) -> Result<Regex> {
+    Ok(Regex::new(str)?)
 }
 
 fn parse_timespec(str: &str) -> Result<SystemTime> {
