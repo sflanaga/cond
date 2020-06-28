@@ -119,6 +119,7 @@ pub struct ParLsCfg {
     /// write cpu time consumed by each thread
     pub write_thread_cpu_time: bool,
 
+    #[structopt(skip)]
     pub update_status: bool,
 }
 
